@@ -43,9 +43,9 @@ def build_graph(tools: list[BaseTool]):
         max_retries=settings.openai_max_retries,
     ).bind_tools(tools)
 
-    def agent_node(state: AgentState) -> AgentState:
+    async def agent_node(state: AgentState) -> AgentState:
         messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
-        response = llm.invoke(messages)
+        response = await llm.ainvoke(messages)
         tool_calls = getattr(response, "tool_calls", None) or []
         if tool_calls:
             logger.debug(

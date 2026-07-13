@@ -81,10 +81,10 @@ def _wrap_user_message(user_message: str, context: dict[str, Any]) -> str:
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest) -> ChatResponse:
+async def chat(request: ChatRequest) -> ChatResponse:
     wrapped_message = _wrap_user_message(request.message, request.context)
     try:
-        result = agent_graph.invoke(
+        result = await agent_graph.ainvoke(
             {"messages": [HumanMessage(content=wrapped_message)]},
             config={
                 "recursion_limit": 50,

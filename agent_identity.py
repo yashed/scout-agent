@@ -51,7 +51,7 @@ class AgentIdentityAuth(httpx.Auth):
 
     async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
         token = await self._get_token()
-        logger.debug("[DEBUG] AgentIdentityAuth: attaching Bearer token to request -> %s %s", request.method, request.url)
+        logger.info("[DEBUG] AgentIdentityAuth: attaching Bearer token to request -> %s %s", request.method, request.url)
         request.headers["Authorization"] = f"Bearer {token}"
         yield request
 
@@ -61,7 +61,7 @@ class AgentIdentityAuth(httpx.Auth):
         # blocks here, then finds a fresh cached token already waiting.
         async with self._lock:
             if self._token and time.monotonic() < self._expiry:
-                logger.debug("[DEBUG] AgentID token cache HIT — reusing cached token (expires in %.1fs)", self._expiry - time.monotonic())
+                logger.info("[DEBUG] AgentID token cache HIT — reusing cached token (expires in %.1fs)", self._expiry - time.monotonic())
                 return self._token
 
             if not agent_identity_configured():
@@ -75,7 +75,7 @@ class AgentIdentityAuth(httpx.Auth):
                     "AgentID has not finished provisioning yet."
                 )
 
-            logger.debug(
+            logger.info(
                 "[DEBUG] AgentID token generation ATTEMPT — endpoint='%s' client_id='%s' scopes='%s'",
                 settings.agentid_token_endpoint,
                 settings.agentid_client_id,
@@ -119,7 +119,7 @@ class AgentIdentityAuth(httpx.Auth):
                 "Minted a new AgentID access token (expires_in=%s)",
                 token_data.get("expires_in"),
             )
-            logger.debug(
+            logger.info(
                 "[OK]   AgentID token generation PASSED — access_token='%s' expires_in=%s",
                 self._token,
                 token_data.get("expires_in"),

@@ -36,12 +36,12 @@ def _server_configs() -> dict[str, dict[str, Any]]:
         "deepwiki": (settings.deepwiki_mcp_url, settings.deepwiki_mcp_api_key),
     }
 
-    logger.debug("=" * 70)
-    logger.debug("[DEBUG] MCP CONFIGURATION CHECK")
-    logger.debug("=" * 70)
+    logger.info("=" * 70)
+    logger.info("[DEBUG] MCP CONFIGURATION CHECK")
+    logger.info("=" * 70)
 
     identity_ready = agent_identity_configured()
-    logger.debug(
+    logger.info(
         "[DEBUG] AgentID credentials: %s",
         "[OK] SET — Bearer token auth will be attached to MCP requests" if identity_ready
         else "[WARN] NOT SET — Bearer token auth will be skipped (MCP may fail with 401)",
@@ -50,14 +50,14 @@ def _server_configs() -> dict[str, dict[str, Any]]:
     configs: dict[str, dict[str, Any]] = {}
     for name, (url, api_key) in proxies.items():
         # Log the actual values (including secrets) for debugging
-        logger.debug(
+        logger.info(
             "[DEBUG] MCP proxy '%s': url='%s' | api_key='%s'",
             name,
             url if url else "(unset/empty)",
             api_key if api_key else "(unset/empty)",
         )
         if url:
-            logger.debug("  [OK]   '%s' URL is configured correctly -> %s", name, url)
+            logger.info("  [OK]   '%s' URL is configured correctly -> %s", name, url)
         else:
             logger.warning(
                 "  [SKIP] '%s' MCP proxy has NO URL configured — this proxy will be skipped. "
@@ -66,9 +66,9 @@ def _server_configs() -> dict[str, dict[str, Any]]:
             )
 
         if api_key:
-            logger.debug("  [OK]   '%s' API key is present (value: %s)", name, api_key)
+            logger.info("  [OK]   '%s' API key is present (value: %s)", name, api_key)
         else:
-            logger.debug("  [WARN] '%s' API key is empty or unset", name)
+            logger.info("  [WARN] '%s' API key is empty or unset", name)
 
         if not url:
             continue
@@ -80,14 +80,14 @@ def _server_configs() -> dict[str, dict[str, Any]]:
         }
         if identity_ready:
             config["auth"] = _agent_identity_auth
-            logger.debug("  [OK]   '%s' AgentID Bearer auth attached", name)
+            logger.info("  [OK]   '%s' AgentID Bearer auth attached", name)
         else:
-            logger.debug("  [WARN] '%s' no AgentID Bearer auth — running without Authorization header", name)
+            logger.info("  [WARN] '%s' no AgentID Bearer auth — running without Authorization header", name)
 
         configs[name] = config
 
-    logger.debug("  Total MCP proxies configured: %d / %d", len(configs), len(proxies))
-    logger.debug("=" * 70)
+    logger.info("  Total MCP proxies configured: %d / %d", len(configs), len(proxies))
+    logger.info("=" * 70)
     return configs
 
 
@@ -107,7 +107,7 @@ async def load_mcp_tools() -> list:
         return []
 
     async def _load_one(name: str, config: dict[str, Any]) -> list:
-        logger.debug("[DEBUG] Attempting to connect to MCP proxy '%s' at url='%s' ...", name, config.get("url"))
+        logger.info("[DEBUG] Attempting to connect to MCP proxy '%s' at url='%s' ...", name, config.get("url"))
         try:
             tools = await MultiServerMCPClient({name: config}).get_tools()
         except Exception as exc:
@@ -139,7 +139,7 @@ async def load_mcp_tools() -> list:
                 )
             return []
         tool_names = [getattr(t, "name", str(t)) for t in tools]
-        logger.debug(
+        logger.info(
             "[OK]   MCP proxy '%s' tool discovery PASSED — loaded %d tool(s): %s",
             name,
             len(tools),
@@ -150,7 +150,7 @@ async def load_mcp_tools() -> list:
 
     results = await asyncio.gather(*(_load_one(name, cfg) for name, cfg in configs.items()))
     all_tools = [tool for tools in results for tool in tools]
-    logger.debug(
+    logger.info(
         "[DEBUG] MCP tool loading complete — total tools loaded across all proxies: %d",
         len(all_tools),
     )

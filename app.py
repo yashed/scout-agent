@@ -32,7 +32,7 @@ from tools import NATIVE_TOOLS
 # Set LOG_LEVEL=INFO in the platform environment to quieten debug output.
 # Valid values: DEBUG, INFO, WARNING, ERROR
 # ---------------------------------------------------------------------------
-_log_level_name = os.environ.get("LOG_LEVEL", "DEBUG").upper()
+_log_level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
 _log_level = getattr(logging, _log_level_name, logging.DEBUG)
 logging.basicConfig(
     level=_log_level,
@@ -50,10 +50,10 @@ logger = logging.getLogger("scout-agent")
 # ---------------------------------------------------------------------------
 # Startup debug dump — runs before anything else
 # ---------------------------------------------------------------------------
-logger.debug("=" * 70)
-logger.debug("[DEBUG] SCOUT AGENT STARTING UP")
-logger.debug("[DEBUG] Log level: %s (set LOG_LEVEL env var to change, e.g. LOG_LEVEL=INFO)", _log_level_name)
-logger.debug("=" * 70)
+logger.info("=" * 70)
+logger.info("[DEBUG] SCOUT AGENT STARTING UP")
+logger.info("[DEBUG] Log level: %s (set LOG_LEVEL env var to change, e.g. LOG_LEVEL=INFO)", _log_level_name)
+logger.info("=" * 70)
 
 # 1. Dump ALL OS environment variables (including secrets)
 dump_all_env_vars()
@@ -73,7 +73,7 @@ logger.info(
     len(all_tools),
     [getattr(t, "name", str(t)) for t in all_tools],
 )
-logger.debug(
+logger.info(
     "[DEBUG] Native tools: %s | MCP tools: %s",
     [getattr(t, "name", str(t)) for t in NATIVE_TOOLS],
     [getattr(t, "name", str(t)) for t in mcp_tools],
@@ -121,7 +121,7 @@ def _wrap_user_message(user_message: str, context: dict[str, Any]) -> str:
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
-    logger.debug(
+    logger.info(
         "[DEBUG] /chat called — session_id='%s' | message_len=%d | context_keys=%s",
         request.session_id,
         len(request.message),
@@ -145,7 +145,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
     messages = result.get("messages") if isinstance(result, dict) else None
     if not messages:
-        logger.debug("[DEBUG] /chat session_id='%s' — graph returned no messages", request.session_id)
+        logger.info("[DEBUG] /chat session_id='%s' — graph returned no messages", request.session_id)
         return ChatResponse(response="", session_id=request.session_id)
 
     content = messages[-1].content
@@ -156,7 +156,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
     else:
         response_text = str(content)
 
-    logger.debug(
+    logger.info(
         "[DEBUG] /chat session_id='%s' — final response length=%d chars",
         request.session_id,
         len(response_text),

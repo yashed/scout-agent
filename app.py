@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any
 
@@ -27,11 +28,14 @@ from mcp_tools import load_mcp_tools
 from tools import NATIVE_TOOLS
 
 # ---------------------------------------------------------------------------
-# Logging — set to DEBUG so all [DEBUG] lines in this branch are visible.
-# Change back to INFO before shipping to production.
+# Logging — controlled by LOG_LEVEL env var (default: DEBUG for this branch).
+# Set LOG_LEVEL=INFO in the platform environment to quieten debug output.
+# Valid values: DEBUG, INFO, WARNING, ERROR
 # ---------------------------------------------------------------------------
+_log_level_name = os.environ.get("LOG_LEVEL", "DEBUG").upper()
+_log_level = getattr(logging, _log_level_name, logging.DEBUG)
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=_log_level,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 # Quieten noisy third-party loggers so our debug lines are easy to spot
@@ -47,7 +51,8 @@ logger = logging.getLogger("scout-agent")
 # Startup debug dump — runs before anything else
 # ---------------------------------------------------------------------------
 logger.debug("=" * 70)
-logger.debug("[DEBUG] SCOUT AGENT STARTING UP — DEBUG LOGGING ENABLED")
+logger.debug("[DEBUG] SCOUT AGENT STARTING UP")
+logger.debug("[DEBUG] Log level: %s (set LOG_LEVEL env var to change, e.g. LOG_LEVEL=INFO)", _log_level_name)
 logger.debug("=" * 70)
 
 # 1. Dump ALL OS environment variables (including secrets)

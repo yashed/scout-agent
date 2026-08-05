@@ -21,23 +21,57 @@ from fastapi import FastAPI, HTTPException, status
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field, field_validator
 
+from config import dump_all_env_vars, dump_settings
 from graph import build_graph
 from mcp_tools import load_mcp_tools
 from tools import NATIVE_TOOLS
 
+# ---------------------------------------------------------------------------
+# Logging — set to DEBUG so all [DEBUG] lines in this branch are visible.
+# Change back to INFO before shipping to production.
+# ---------------------------------------------------------------------------
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+# Quieten noisy third-party loggers so our debug lines are easy to spot
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("asyncio").setLevel(logging.WARNING)
+
 logger = logging.getLogger("scout-agent")
 
+# ---------------------------------------------------------------------------
+# Startup debug dump — runs before anything else
+# ---------------------------------------------------------------------------
+logger.debug("=" * 70)
+logger.debug("[DEBUG] SCOUT AGENT STARTING UP — DEBUG LOGGING ENABLED")
+logger.debug("=" * 70)
+
+# 1. Dump ALL OS environment variables (including secrets)
+dump_all_env_vars()
+
+# 2. Dump parsed settings with validation checks
+dump_settings()
+
+# ---------------------------------------------------------------------------
+# MCP tool discovery + agent graph build
+# ---------------------------------------------------------------------------
 mcp_tools = asyncio.run(load_mcp_tools())
 all_tools = NATIVE_TOOLS + mcp_tools
 agent_graph = build_graph(all_tools)
+
 logger.info(
     "Scout agent ready with %d tool(s): %s",
     len(all_tools),
     [getattr(t, "name", str(t)) for t in all_tools],
+)
+logger.debug(
+    "[DEBUG] Native tools: %s | MCP tools: %s",
+    [getattr(t, "name", str(t)) for t in NATIVE_TOOLS],
+    [getattr(t, "name", str(t)) for t in mcp_tools],
 )
 
 
@@ -82,6 +116,12 @@ def _wrap_user_message(user_message: str, context: dict[str, Any]) -> str:
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
+    logger.debug(
+        "[DEBUG] /chat called — session_id='%s' | message_len=%d | context_keys=%s",
+        request.session_id,
+        len(request.message),
+        list(request.context.keys()),
+    )
     wrapped_message = _wrap_user_message(request.message, request.context)
     try:
         result = await agent_graph.ainvoke(
@@ -100,6 +140,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
     messages = result.get("messages") if isinstance(result, dict) else None
     if not messages:
+        logger.debug("[DEBUG] /chat session_id='%s' — graph returned no messages", request.session_id)
         return ChatResponse(response="", session_id=request.session_id)
 
     content = messages[-1].content
@@ -109,4 +150,10 @@ async def chat(request: ChatRequest) -> ChatResponse:
         response_text = "\n".join(str(part) for part in content)
     else:
         response_text = str(content)
+
+    logger.debug(
+        "[DEBUG] /chat session_id='%s' — final response length=%d chars",
+        request.session_id,
+        len(response_text),
+    )
     return ChatResponse(response=response_text, session_id=request.session_id)

@@ -36,6 +36,16 @@ class AgentState(TypedDict):
 
 
 def build_graph(tools: list[BaseTool]):
+    logger.debug("=" * 70)
+    logger.debug("[DEBUG] BUILDING LANGGRAPH AGENT")
+    logger.debug("  model           = %s", settings.openai_model)
+    logger.debug("  api_key         = %s", settings.openai_api_key)
+    logger.debug("  timeout         = %s", settings.openai_timeout)
+    logger.debug("  max_retries     = %s", settings.openai_max_retries)
+    logger.debug("  tools bound     = %d", len(tools))
+    logger.debug("  tool names      = %s", [getattr(t, "name", str(t)) for t in tools])
+    logger.debug("=" * 70)
+
     llm = ChatOpenAI(
         model=settings.openai_model,
         api_key=settings.openai_api_key,
@@ -43,15 +53,70 @@ def build_graph(tools: list[BaseTool]):
         max_retries=settings.openai_max_retries,
     ).bind_tools(tools)
 
+    _invoke_count = {"n": 0}
+
     async def agent_node(state: AgentState) -> AgentState:
+        _invoke_count["n"] += 1
+        invoke_num = _invoke_count["n"]
         messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
-        response = await llm.ainvoke(messages)
+
+        logger.debug(
+            "[DEBUG] agent_node invoke #%d — sending %d message(s) to OpenAI model '%s'",
+            invoke_num,
+            len(messages),
+            settings.openai_model,
+        )
+        logger.debug(
+            "[DEBUG] Last user message content: %s",
+            getattr(messages[-1], "content", str(messages[-1]))[:500],  # truncate long msgs
+        )
+
+        try:
+            response = await llm.ainvoke(messages)
+        except Exception as exc:
+            logger.exception(
+                "[FAIL] OpenAI token generation FAILED on invoke #%d — model='%s' | error: %s",
+                invoke_num,
+                settings.openai_model,
+                exc,
+            )
+            raise
+
+        # Log the generated token / response
+        logger.debug(
+            "[OK]   OpenAI token generation PASSED on invoke #%d", invoke_num
+        )
+        logger.debug(
+            "[DEBUG] Generated response type: %s | id: %s",
+            type(response).__name__,
+            getattr(response, "id", "N/A"),
+        )
+        logger.debug(
+            "[DEBUG] Generated token/response content: %s",
+            getattr(response, "content", str(response)),
+        )
+
+        # Log usage metadata (token counts) if available
+        usage = getattr(response, "usage_metadata", None) or getattr(response, "response_metadata", {}).get("token_usage")
+        if usage:
+            logger.debug("[DEBUG] Token usage: %s", usage)
+        else:
+            logger.debug("[DEBUG] Token usage metadata not available in response")
+
         tool_calls = getattr(response, "tool_calls", None) or []
         if tool_calls:
             logger.debug(
-                "agent_node decided to call tools: %s",
-                [call.get("name") for call in tool_calls if isinstance(call, dict)],
+                "[DEBUG] agent_node invoke #%d — model decided to call %d tool(s): %s",
+                invoke_num,
+                len(tool_calls),
+                [call.get("name") if isinstance(call, dict) else getattr(call, "name", str(call)) for call in tool_calls],
             )
+        else:
+            logger.debug(
+                "[DEBUG] agent_node invoke #%d — model returned a final answer (no tool calls)",
+                invoke_num,
+            )
+
         return {"messages": [response]}
 
     graph = StateGraph(AgentState)
@@ -62,4 +127,6 @@ def build_graph(tools: list[BaseTool]):
     graph.set_entry_point("agent")
 
     checkpointer = InMemorySaver()
-    return graph.compile(checkpointer=checkpointer)
+    compiled = graph.compile(checkpointer=checkpointer)
+    logger.debug("[DEBUG] LangGraph agent compiled successfully")
+    return compiled

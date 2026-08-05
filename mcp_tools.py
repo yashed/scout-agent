@@ -6,9 +6,14 @@ from typing import Any
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
+from agent_identity import AgentIdentityAuth, agent_identity_configured
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+# Shared across every proxy config so they reuse one AgentID token cache
+# instead of each minting their own.
+_agent_identity_auth = AgentIdentityAuth()
 
 
 def _server_configs() -> dict[str, dict[str, Any]]:
@@ -20,6 +25,11 @@ def _server_configs() -> dict[str, dict[str, Any]]:
     inconsistent about which header its gateway expects (the proxy's
     Security tab defaults to `X-API-Key`, but the Tool Configuration
     integration snippet uses `API-Key`) — sending both is harmless.
+
+    When AgentID credentials have been injected (platform-hosted agents,
+    see agent_identity.py), each proxy's client also gets an `auth` that
+    attaches a live `Authorization: Bearer` token to every request, minted
+    and refreshed on demand.
     """
     proxies = {
         "fetch": (settings.fetch_mcp_url, settings.fetch_mcp_api_key),
@@ -29,6 +39,13 @@ def _server_configs() -> dict[str, dict[str, Any]]:
     logger.debug("=" * 70)
     logger.debug("[DEBUG] MCP CONFIGURATION CHECK")
     logger.debug("=" * 70)
+
+    identity_ready = agent_identity_configured()
+    logger.debug(
+        "[DEBUG] AgentID credentials: %s",
+        "[OK] SET — Bearer token auth will be attached to MCP requests" if identity_ready
+        else "[WARN] NOT SET — Bearer token auth will be skipped (MCP may fail with 401)",
+    )
 
     configs: dict[str, dict[str, Any]] = {}
     for name, (url, api_key) in proxies.items():
@@ -56,16 +73,18 @@ def _server_configs() -> dict[str, dict[str, Any]]:
         if not url:
             continue
 
-        configs[name] = {
+        config: dict[str, Any] = {
             "url": url,
             "transport": "streamable_http",
             "headers": {"API-Key": api_key, "X-API-Key": api_key} if api_key else {},
         }
-        logger.debug(
-            "  [OK]   '%s' added to MCP config with headers: %s",
-            name,
-            {"API-Key": api_key, "X-API-Key": api_key} if api_key else {},
-        )
+        if identity_ready:
+            config["auth"] = _agent_identity_auth
+            logger.debug("  [OK]   '%s' AgentID Bearer auth attached", name)
+        else:
+            logger.debug("  [WARN] '%s' no AgentID Bearer auth — running without Authorization header", name)
+
+        configs[name] = config
 
     logger.debug("  Total MCP proxies configured: %d / %d", len(configs), len(proxies))
     logger.debug("=" * 70)

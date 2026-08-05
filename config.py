@@ -28,6 +28,16 @@ class Settings(BaseSettings):
     deepwiki_mcp_url: str = Field(default="", validation_alias="DEEPWIKI_URL")
     deepwiki_mcp_api_key: str = Field(default="", validation_alias="DEEPWIKI_API_KEY")
 
+    # AgentID credentials, auto-injected by Agent Manager into every
+    # platform-hosted agent's pod (see docs:
+    # tutorials/use-agentid-in-platform-hosted-agents). Used to mint bearer
+    # tokens for MCP gateway calls; left unset when running locally or as an
+    # externally-hosted agent, in which case AgentID auth is skipped.
+    agentid_client_id: str = Field(default="", validation_alias="AMP_AGENTID_CLIENT_ID")
+    agentid_client_secret: str = Field(default="", validation_alias="AMP_AGENTID_CLIENT_SECRET")
+    agentid_token_endpoint: str = Field(default="", validation_alias="AMP_AGENTID_TOKEN_ENDPOINT")
+    agentid_scopes: str = Field(default="", validation_alias="AMP_AGENTID_SCOPES")
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
@@ -62,10 +72,14 @@ def dump_settings() -> None:
     logger.debug("  openai_model       = %s", settings.openai_model)
     logger.debug("  openai_timeout     = %s", settings.openai_timeout)
     logger.debug("  openai_max_retries = %s", settings.openai_max_retries)
-    logger.debug("  FETCH_URL          = %s", settings.fetch_mcp_url if settings.fetch_mcp_url else "(unset)")
-    logger.debug("  FETCH_API_KEY      = %s", settings.fetch_mcp_api_key if settings.fetch_mcp_api_key else "(unset)")
-    logger.debug("  DEEPWIKI_URL       = %s", settings.deepwiki_mcp_url if settings.deepwiki_mcp_url else "(unset)")
-    logger.debug("  DEEPWIKI_API_KEY   = %s", settings.deepwiki_mcp_api_key if settings.deepwiki_mcp_api_key else "(unset)")
+    logger.debug("  FETCH_URL                  = %s", settings.fetch_mcp_url if settings.fetch_mcp_url else "(unset)")
+    logger.debug("  FETCH_API_KEY              = %s", settings.fetch_mcp_api_key if settings.fetch_mcp_api_key else "(unset)")
+    logger.debug("  DEEPWIKI_URL               = %s", settings.deepwiki_mcp_url if settings.deepwiki_mcp_url else "(unset)")
+    logger.debug("  DEEPWIKI_API_KEY           = %s", settings.deepwiki_mcp_api_key if settings.deepwiki_mcp_api_key else "(unset)")
+    logger.debug("  AMP_AGENTID_CLIENT_ID      = %s", settings.agentid_client_id if settings.agentid_client_id else "(unset)")
+    logger.debug("  AMP_AGENTID_CLIENT_SECRET  = %s", settings.agentid_client_secret if settings.agentid_client_secret else "(unset)")
+    logger.debug("  AMP_AGENTID_TOKEN_ENDPOINT = %s", settings.agentid_token_endpoint if settings.agentid_token_endpoint else "(unset)")
+    logger.debug("  AMP_AGENTID_SCOPES         = %s", settings.agentid_scopes if settings.agentid_scopes else "(unset)")
     logger.debug("=" * 70)
 
     # Quick validation checks
@@ -94,5 +108,24 @@ def dump_settings() -> None:
         logger.debug("  [OK]    DEEPWIKI_API_KEY is set")
     else:
         logger.debug("  [WARN]  DEEPWIKI_API_KEY is not set")
+
+    # AgentID validation
+    agentid_all_set = all([
+        settings.agentid_client_id,
+        settings.agentid_client_secret,
+        settings.agentid_token_endpoint,
+    ])
+    if agentid_all_set:
+        logger.debug("  [OK]    AgentID credentials fully set — Bearer token auth will be used for MCP")
+    else:
+        missing = []
+        if not settings.agentid_client_id:      missing.append("AMP_AGENTID_CLIENT_ID")
+        if not settings.agentid_client_secret:   missing.append("AMP_AGENTID_CLIENT_SECRET")
+        if not settings.agentid_token_endpoint:  missing.append("AMP_AGENTID_TOKEN_ENDPOINT")
+        logger.warning(
+            "  [WARN]  AgentID credentials NOT set (missing: %s) — "
+            "Bearer token auth will be SKIPPED. MCP calls may fail with 401 if the gateway requires it.",
+            ", ".join(missing),
+        )
 
     logger.debug("=" * 70)

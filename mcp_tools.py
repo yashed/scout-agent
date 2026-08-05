@@ -92,12 +92,32 @@ async def load_mcp_tools() -> list:
         try:
             tools = await MultiServerMCPClient({name: config}).get_tools()
         except Exception as exc:
-            logger.exception(
-                "[FAIL] MCP proxy '%s' tool discovery FAILED — proxy url='%s' | error: %s",
-                name,
-                config.get("url"),
-                exc,
-            )
+            # Unwrap ExceptionGroup (Python 3.11+ / anyio TaskGroup) to surface
+            # the real underlying error instead of just "unhandled errors in a TaskGroup".
+            sub_exceptions = getattr(exc, "exceptions", None)
+            if sub_exceptions:
+                logger.error(
+                    "[FAIL] MCP proxy '%s' tool discovery FAILED (ExceptionGroup with %d sub-error(s)) "
+                    "— proxy url='%s'",
+                    name,
+                    len(sub_exceptions),
+                    config.get("url"),
+                )
+                for i, sub_exc in enumerate(sub_exceptions, start=1):
+                    logger.error(
+                        "[FAIL]   sub-error #%d: %s: %s",
+                        i,
+                        type(sub_exc).__name__,
+                        sub_exc,
+                    )
+            else:
+                logger.exception(
+                    "[FAIL] MCP proxy '%s' tool discovery FAILED — proxy url='%s' | %s: %s",
+                    name,
+                    config.get("url"),
+                    type(exc).__name__,
+                    exc,
+                )
             return []
         tool_names = [getattr(t, "name", str(t)) for t in tools]
         logger.debug(

@@ -11,9 +11,8 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
-# Shared across every proxy config so they reuse one AgentID token cache
-# instead of each minting their own.
-_agent_identity_auth = AgentIdentityAuth()
+# Shared cache mapping: one AgentIdentityAuth per resource (proxy handle)
+_agent_identity_auths: dict[str, AgentIdentityAuth] = {}
 
 
 def _server_configs() -> dict[str, dict[str, Any]]:
@@ -79,7 +78,9 @@ def _server_configs() -> dict[str, dict[str, Any]]:
             "headers": {"API-Key": api_key, "X-API-Key": api_key} if api_key else {},
         }
         if identity_ready:
-            config["auth"] = _agent_identity_auth
+            if name not in _agent_identity_auths:
+                _agent_identity_auths[name] = AgentIdentityAuth(resource=name)
+            config["auth"] = _agent_identity_auths[name]
             logger.info("  [OK]   '%s' AgentID Bearer auth attached", name)
         else:
             logger.info("  [WARN] '%s' no AgentID Bearer auth — running without Authorization header", name)

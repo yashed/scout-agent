@@ -44,7 +44,8 @@ class AgentIdentityAuth(httpx.Auth):
     the token cache instead of each minting their own token.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, resource: str | None = None) -> None:
+        self._resource = resource
         self._token: str | None = None
         self._expiry = 0.0
         self._lock = asyncio.Lock()
@@ -76,20 +77,24 @@ class AgentIdentityAuth(httpx.Auth):
                 )
 
             logger.info(
-                "[DEBUG] AgentID token generation ATTEMPT — endpoint='%s' client_id='%s' scopes='%s'",
+                "[DEBUG] AgentID token generation ATTEMPT — endpoint='%s' client_id='%s' scopes='%s' resource='%s'",
                 settings.agentid_token_endpoint,
                 settings.agentid_client_id,
                 settings.agentid_scopes,
+                self._resource,
             )
 
             try:
                 async with httpx.AsyncClient(timeout=10) as client:
+                    post_data = {
+                        "grant_type": "client_credentials",
+                        "scope": settings.agentid_scopes,
+                    }
+                    if self._resource:
+                        post_data["resource"] = self._resource
                     response = await client.post(
                         settings.agentid_token_endpoint,
-                        data={
-                            "grant_type": "client_credentials",
-                            "scope": settings.agentid_scopes,
-                        },
+                        data=post_data,
                         auth=(settings.agentid_client_id, settings.agentid_client_secret),
                     )
                     response.raise_for_status()

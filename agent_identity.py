@@ -40,8 +40,10 @@ class AgentIdentityAuth(httpx.Auth):
     """Attaches a cached AgentID bearer token to every request, minting or
     refreshing it via the client_credentials grant as needed.
 
-    Share one instance across every MCP proxy's client config so they share
-    the token cache instead of each minting their own token.
+    A client_credentials token binds to exactly one resource server, so each
+    MCP proxy needs its own instance (constructed with that proxy's
+    ``resource`` indicator) and therefore its own token cache — do not share
+    one instance across proxies with different resources.
     """
 
     def __init__(self, resource: str | None = None) -> None:

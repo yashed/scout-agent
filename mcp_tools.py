@@ -79,7 +79,7 @@ def _server_configs() -> dict[str, dict[str, Any]]:
         }
         if identity_ready:
             if name not in _agent_identity_auths:
-                _agent_identity_auths[name] = AgentIdentityAuth(resource=f"urn:mcp:{name}")
+                _agent_identity_auths[name] = AgentIdentityAuth(resource=url)
             config["auth"] = _agent_identity_auths[name]
             logger.info("  [OK]   '%s' AgentID Bearer auth attached", name)
         else:

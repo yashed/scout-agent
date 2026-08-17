@@ -40,18 +40,25 @@ def build_graph(tools: list[BaseTool]):
     logger.info("[DEBUG] BUILDING LANGGRAPH AGENT")
     logger.info("  model           = %s", settings.anthropic_model)
     logger.info("  api_key         = %s", settings.anthropic_api_key)
+    logger.info("  gateway_url     = %s", settings.anthropic_url if settings.anthropic_url else "(unset / direct Anthropic API)")
     logger.info("  timeout         = %s", settings.anthropic_timeout)
     logger.info("  max_retries     = %s", settings.anthropic_max_retries)
     logger.info("  tools bound     = %d", len(tools))
     logger.info("  tool names      = %s", [getattr(t, "name", str(t)) for t in tools])
     logger.info("=" * 70)
 
-    llm = ChatAnthropic(
-        model=settings.anthropic_model,
-        api_key=settings.anthropic_api_key,
-        timeout=settings.anthropic_timeout,
-        max_retries=settings.anthropic_max_retries,
-    ).bind_tools(tools)
+    llm_kwargs = {
+        "model": settings.anthropic_model,
+        "api_key": settings.anthropic_api_key or "dummy",
+        "timeout": settings.anthropic_timeout,
+        "max_retries": settings.anthropic_max_retries,
+    }
+    if settings.anthropic_url:
+        llm_kwargs["anthropic_api_url"] = settings.anthropic_url
+        if settings.anthropic_api_key:
+            llm_kwargs["default_headers"] = {"API-Key": settings.anthropic_api_key}
+
+    llm = ChatAnthropic(**llm_kwargs).bind_tools(tools)
 
     _invoke_count = {"n": 0}
 

@@ -8,6 +8,7 @@ logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
+    anthropic_url: str = Field(default="", validation_alias="ANTHROPIC_URL")
     anthropic_api_key: str = Field(default="", validation_alias="ANTHROPIC_API_KEY")
     anthropic_model: str = Field(default="claude-3-5-sonnet-20241022", validation_alias="ANTHROPIC_MODEL")
     anthropic_timeout: float = Field(
@@ -68,6 +69,7 @@ def dump_settings() -> None:
     logger.info("=" * 70)
     logger.info("[DEBUG] PARSED SETTINGS (from env / .env file)")
     logger.info("=" * 70)
+    logger.info("  anthropic_url         = %s", settings.anthropic_url if settings.anthropic_url else "(unset / direct API)")
     logger.info("  anthropic_api_key     = %s", settings.anthropic_api_key)
     logger.info("  anthropic_model       = %s", settings.anthropic_model)
     logger.info("  anthropic_timeout     = %s", settings.anthropic_timeout)
@@ -84,6 +86,11 @@ def dump_settings() -> None:
 
     # Quick validation checks
     logger.info("[DEBUG] SETTINGS VALIDATION CHECKS")
+    if settings.anthropic_url:
+        logger.info("  [OK]    ANTHROPIC_URL is set -> using Agent Manager AI Gateway: %s", settings.anthropic_url)
+    else:
+        logger.info("  [INFO]  ANTHROPIC_URL is not set — calling Anthropic API directly")
+
     if settings.anthropic_api_key:
         logger.info("  [OK]    ANTHROPIC_API_KEY is set")
     else:

@@ -95,6 +95,7 @@ it to your own GitHub repository first, then point Agent Manager at it.
 4. Environment variables:
 
    ```env
+   ANTHROPIC_URL=<agent-manager-ai-gateway-url>
    ANTHROPIC_API_KEY=<your-anthropic-api-key>
    ANTHROPIC_MODEL=claude-3-5-sonnet-20241022
    ```

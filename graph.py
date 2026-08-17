@@ -5,7 +5,7 @@ from typing import Annotated, TypedDict
 
 from langchain_core.messages import BaseMessage, SystemMessage
 from langchain_core.tools import BaseTool
-from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import StateGraph
 from langgraph.graph.message import add_messages
@@ -38,19 +38,19 @@ class AgentState(TypedDict):
 def build_graph(tools: list[BaseTool]):
     logger.info("=" * 70)
     logger.info("[DEBUG] BUILDING LANGGRAPH AGENT")
-    logger.info("  model           = %s", settings.openai_model)
-    logger.info("  api_key         = %s", settings.openai_api_key)
-    logger.info("  timeout         = %s", settings.openai_timeout)
-    logger.info("  max_retries     = %s", settings.openai_max_retries)
+    logger.info("  model           = %s", settings.anthropic_model)
+    logger.info("  api_key         = %s", settings.anthropic_api_key)
+    logger.info("  timeout         = %s", settings.anthropic_timeout)
+    logger.info("  max_retries     = %s", settings.anthropic_max_retries)
     logger.info("  tools bound     = %d", len(tools))
     logger.info("  tool names      = %s", [getattr(t, "name", str(t)) for t in tools])
     logger.info("=" * 70)
 
-    llm = ChatOpenAI(
-        model=settings.openai_model,
-        api_key=settings.openai_api_key,
-        timeout=settings.openai_timeout,
-        max_retries=settings.openai_max_retries,
+    llm = ChatAnthropic(
+        model=settings.anthropic_model,
+        api_key=settings.anthropic_api_key,
+        timeout=settings.anthropic_timeout,
+        max_retries=settings.anthropic_max_retries,
     ).bind_tools(tools)
 
     _invoke_count = {"n": 0}
@@ -61,10 +61,10 @@ def build_graph(tools: list[BaseTool]):
         messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
 
         logger.info(
-            "[DEBUG] agent_node invoke #%d — sending %d message(s) to OpenAI model '%s'",
+            "[DEBUG] agent_node invoke #%d — sending %d message(s) to Anthropic model '%s'",
             invoke_num,
             len(messages),
-            settings.openai_model,
+            settings.anthropic_model,
         )
         logger.info(
             "[DEBUG] Last user message content: %s",
@@ -75,16 +75,16 @@ def build_graph(tools: list[BaseTool]):
             response = await llm.ainvoke(messages)
         except Exception as exc:
             logger.exception(
-                "[FAIL] OpenAI token generation FAILED on invoke #%d — model='%s' | error: %s",
+                "[FAIL] Anthropic token generation FAILED on invoke #%d — model='%s' | error: %s",
                 invoke_num,
-                settings.openai_model,
+                settings.anthropic_model,
                 exc,
             )
             raise
 
         # Log the generated token / response
         logger.info(
-            "[OK]   OpenAI token generation PASSED on invoke #%d", invoke_num
+            "[OK]   Anthropic token generation PASSED on invoke #%d", invoke_num
         )
         logger.info(
             "[DEBUG] Generated response type: %s | id: %s",

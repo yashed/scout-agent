@@ -1,13 +1,13 @@
 # Scout - Multi-Tool Test Agent
 
-Scout is a small LangGraph + OpenAI agent built to exercise Agent Manager (AMP)
+Scout is a small LangGraph + Anthropic Claude agent built to exercise Agent Manager (AMP)
 end-to-end: a platform-hosted Chat Agent with **native Python tools** and
 **multiple MCP proxies** attached, wired together with LangGraph's tool-calling
 loop.
 
 ## What it demonstrates
 
-- **LangGraph agent** with an OpenAI chat model (`ChatOpenAI`) bound to tools,
+- **LangGraph agent** with an Anthropic chat model (`ChatAnthropic`) bound to tools,
   following the same `agent -> tools -> agent` loop as `hotel-booking-agent`.
 - **Native tools** (no MCP, free public APIs, no keys required):
   - `get_weather_tool` - current weather for a city (Open-Meteo)
@@ -23,7 +23,7 @@ loop.
 
 | File | Role |
 |---|---|
-| `config.py` | Settings: OpenAI config + injected MCP proxy URL/API-key env vars |
+| `config.py` | Settings: Anthropic config + injected MCP proxy URL/API-key env vars |
 | `tools.py` | Native tools (weather, currency, country facts) |
 | `mcp_tools.py` | Builds a `MultiServerMCPClient` from whatever proxies are configured and discovers their tools |
 | `graph.py` | LangGraph `StateGraph` wiring the LLM and tools together |
@@ -32,7 +32,7 @@ loop.
 
 ## Prerequisites
 
-- An OpenAI API key.
+- An Anthropic API key.
 - Access to the Agent Manager console.
 - A Render account (free tier) to host the Fetch MCP bridge.
 
@@ -95,8 +95,8 @@ it to your own GitHub repository first, then point Agent Manager at it.
 4. Environment variables:
 
    ```env
-   OPENAI_API_KEY=<your-openai-api-key>
-   OPENAI_MODEL=gpt-4o-mini
+   ANTHROPIC_API_KEY=<your-anthropic-api-key>
+   ANTHROPIC_MODEL=claude-3-5-sonnet-20241022
    ```
 
 5. Optionally attach both MCP proxies right here under **MCP Proxies

@@ -18,9 +18,13 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
+import dotenv
 from fastapi import FastAPI, HTTPException, status
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field, field_validator
+
+# Load environment variables from a .env file into os.environ if present
+dotenv.load_dotenv()
 
 from config import dump_all_env_vars, dump_settings
 from graph import build_graph
@@ -41,7 +45,7 @@ logging.basicConfig(
 # Quieten noisy third-party loggers so our debug lines are easy to spot
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("anthropic").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
 

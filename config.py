@@ -8,15 +8,15 @@ logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
-    openai_api_key: str
-    openai_model: str = "gpt-4o-mini"
-    openai_timeout: float = Field(
+    anthropic_api_key: str = Field(default="", validation_alias="ANTHROPIC_API_KEY")
+    anthropic_model: str = Field(default="claude-3-5-sonnet-20241022", validation_alias="ANTHROPIC_MODEL")
+    anthropic_timeout: float = Field(
         default=30.0,
-        description="Timeout in seconds for OpenAI API calls.",
+        description="Timeout in seconds for Anthropic API calls.",
     )
-    openai_max_retries: int = Field(
+    anthropic_max_retries: int = Field(
         default=3,
-        description="Maximum retry attempts for OpenAI API calls.",
+        description="Maximum retry attempts for Anthropic API calls.",
     )
 
     # MCP Tool Configuration env vars injected by Agent Manager. Names below
@@ -68,10 +68,10 @@ def dump_settings() -> None:
     logger.info("=" * 70)
     logger.info("[DEBUG] PARSED SETTINGS (from env / .env file)")
     logger.info("=" * 70)
-    logger.info("  openai_api_key     = %s", settings.openai_api_key)
-    logger.info("  openai_model       = %s", settings.openai_model)
-    logger.info("  openai_timeout     = %s", settings.openai_timeout)
-    logger.info("  openai_max_retries = %s", settings.openai_max_retries)
+    logger.info("  anthropic_api_key     = %s", settings.anthropic_api_key)
+    logger.info("  anthropic_model       = %s", settings.anthropic_model)
+    logger.info("  anthropic_timeout     = %s", settings.anthropic_timeout)
+    logger.info("  anthropic_max_retries = %s", settings.anthropic_max_retries)
     logger.info("  FETCH_URL                  = %s", settings.fetch_mcp_url if settings.fetch_mcp_url else "(unset)")
     logger.info("  FETCH_API_KEY              = %s", settings.fetch_mcp_api_key if settings.fetch_mcp_api_key else "(unset)")
     logger.info("  DEEPWIKI_URL               = %s", settings.deepwiki_mcp_url if settings.deepwiki_mcp_url else "(unset)")
@@ -84,10 +84,10 @@ def dump_settings() -> None:
 
     # Quick validation checks
     logger.info("[DEBUG] SETTINGS VALIDATION CHECKS")
-    if settings.openai_api_key:
-        logger.info("  [OK]    OPENAI_API_KEY is set")
+    if settings.anthropic_api_key:
+        logger.info("  [OK]    ANTHROPIC_API_KEY is set")
     else:
-        logger.warning("  [FAIL]  OPENAI_API_KEY is MISSING — agent will not be able to call OpenAI")
+        logger.warning("  [FAIL]  ANTHROPIC_API_KEY is MISSING — agent will not be able to call Anthropic")
 
     if settings.fetch_mcp_url:
         logger.info("  [OK]    FETCH_URL is set -> %s", settings.fetch_mcp_url)

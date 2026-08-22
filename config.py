@@ -8,8 +8,16 @@ logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
-    openai_api_key: str
-    openai_model: str = "gpt-4o-mini"
+    # LLM routing flag. When USE_LLM_PROVIDER=true the agent routes chat
+    # completions through the Agent Manager LLM proxy / AI gateway
+    # (LLM_PROVIDER_URL + LLM_PROVIDER_KEY, OpenAI-compatible). When false
+    # (the default) it calls OpenAI directly with OPENAI_API_KEY.
+    use_llm_provider: bool = Field(default=False, validation_alias="USE_LLM_PROVIDER")
+    llm_provider_url: str = Field(default="", validation_alias="LLM_PROVIDER_URL")
+    llm_provider_key: str = Field(default="", validation_alias="LLM_PROVIDER_KEY")
+
+    openai_api_key: str = Field(default="", validation_alias="OPENAI_API_KEY")
+    openai_model: str = Field(default="gpt-4o-mini", validation_alias="OPENAI_MODEL")
     openai_timeout: float = Field(
         default=30.0,
         description="Timeout in seconds for OpenAI API calls.",
@@ -68,6 +76,9 @@ def dump_settings() -> None:
     logger.info("=" * 70)
     logger.info("[DEBUG] PARSED SETTINGS (from env / .env file)")
     logger.info("=" * 70)
+    logger.info("  use_llm_provider   = %s", settings.use_llm_provider)
+    logger.info("  llm_provider_url   = %s", settings.llm_provider_url if settings.llm_provider_url else "(unset)")
+    logger.info("  llm_provider_key   = %s", settings.llm_provider_key if settings.llm_provider_key else "(unset)")
     logger.info("  openai_api_key     = %s", settings.openai_api_key)
     logger.info("  openai_model       = %s", settings.openai_model)
     logger.info("  openai_timeout     = %s", settings.openai_timeout)
@@ -84,10 +95,22 @@ def dump_settings() -> None:
 
     # Quick validation checks
     logger.info("[DEBUG] SETTINGS VALIDATION CHECKS")
-    if settings.openai_api_key:
-        logger.info("  [OK]    OPENAI_API_KEY is set")
+    if settings.use_llm_provider:
+        logger.info("  [OK]    USE_LLM_PROVIDER is true — routing through the Agent Manager LLM proxy")
+        if settings.llm_provider_url:
+            logger.info("  [OK]    LLM_PROVIDER_URL is set -> %s", settings.llm_provider_url)
+        else:
+            logger.warning("  [FAIL]  LLM_PROVIDER_URL is MISSING — proxy calls will fail")
+        if settings.llm_provider_key:
+            logger.info("  [OK]    LLM_PROVIDER_KEY is set")
+        else:
+            logger.warning("  [FAIL]  LLM_PROVIDER_KEY is MISSING — proxy calls will 401")
     else:
-        logger.warning("  [FAIL]  OPENAI_API_KEY is MISSING — agent will not be able to call OpenAI")
+        logger.info("  [INFO]  USE_LLM_PROVIDER is false — calling OpenAI directly")
+        if settings.openai_api_key:
+            logger.info("  [OK]    OPENAI_API_KEY is set")
+        else:
+            logger.warning("  [FAIL]  OPENAI_API_KEY is MISSING — agent will not be able to call OpenAI")
 
     if settings.fetch_mcp_url:
         logger.info("  [OK]    FETCH_URL is set -> %s", settings.fetch_mcp_url)

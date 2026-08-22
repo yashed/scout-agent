@@ -38,20 +38,41 @@ class AgentState(TypedDict):
 def build_graph(tools: list[BaseTool]):
     logger.info("=" * 70)
     logger.info("[DEBUG] BUILDING LANGGRAPH AGENT")
+    logger.info("  llm mode        = %s", "agent-manager LLM proxy" if settings.use_llm_provider else "OpenAI direct")
     logger.info("  model           = %s", settings.openai_model)
-    logger.info("  api_key         = %s", settings.openai_api_key)
+    logger.info("  llm_provider_url= %s", settings.llm_provider_url if settings.use_llm_provider else "(direct OpenAI)")
     logger.info("  timeout         = %s", settings.openai_timeout)
     logger.info("  max_retries     = %s", settings.openai_max_retries)
     logger.info("  tools bound     = %d", len(tools))
     logger.info("  tool names      = %s", [getattr(t, "name", str(t)) for t in tools])
     logger.info("=" * 70)
 
-    llm = ChatOpenAI(
-        model=settings.openai_model,
-        api_key=settings.openai_api_key,
-        timeout=settings.openai_timeout,
-        max_retries=settings.openai_max_retries,
-    ).bind_tools(tools)
+    if settings.use_llm_provider:
+        # Route through the Agent Manager LLM proxy / AI gateway. The gateway is
+        # OpenAI-compatible and authenticates via the "API-Key" header; the key
+        # is gateway-scoped (NOT a raw OpenAI key). Blank out "Authorization" so
+        # the OpenAI SDK's default "Bearer <api_key>" header doesn't override it.
+        llm_kwargs = {
+            "model": settings.openai_model,
+            "base_url": settings.llm_provider_url,
+            "api_key": "not-used",
+            "timeout": settings.openai_timeout,
+            "max_retries": settings.openai_max_retries,
+            "default_headers": {
+                "API-Key": settings.llm_provider_key,
+                "Authorization": "",
+            },
+        }
+    else:
+        # Call OpenAI directly with the configured OPENAI_API_KEY.
+        llm_kwargs = {
+            "model": settings.openai_model,
+            "api_key": settings.openai_api_key or "dummy",
+            "timeout": settings.openai_timeout,
+            "max_retries": settings.openai_max_retries,
+        }
+
+    llm = ChatOpenAI(**llm_kwargs).bind_tools(tools)
 
     _invoke_count = {"n": 0}
 

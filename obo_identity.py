@@ -30,6 +30,32 @@ not assumed from the RFC alone:
   Agent Manager's "Invocation security is OAuth" + "Token forwarding" are
   both enabled for this agent (see the Agent ID -> Delegated Access readiness
   checklist in the console).
+
+Challenge-and-retry (RFC 9728): a single exchange is not the whole story. If
+the MCP gateway rejects a call because the delegated token lacks a scope, it
+is expected to answer with::
+
+    403 Forbidden
+    WWW-Authenticate: Bearer error="insufficient_scope",
+      scope="orders:read",
+      resource_metadata="https://gateway.example.com/orders/.well-known/oauth-protected-resource"
+
+``DelegatedTokenAuth`` reacts to exactly that: it fetches and validates the
+advertised protected-resource metadata, re-exchanges the *original* caller
+token (never the token it already minted — there is no token-of-a-token
+chaining in this design) for the resource/scope the challenge named, and
+retries the call once. This means the ``<PROXY>_OBO_SCOPES`` env vars below
+are a starting guess, not a requirement: leaving them unset still works as
+long as the gateway's challenge is correct, which is the one thing this
+module cannot guarantee — see the caveat below.
+
+Known caveat, carried over from the platform's own design doc rather than
+discovered here: as of this writing the MCP gateway policy has a documented,
+not-yet-confirmed-fixed bug where it reports ``invalid_token`` instead of
+``insufficient_scope`` for this exact missing-scope case. This module treats
+both error codes as a possible scope challenge so it recovers either way;
+a genuinely invalid/expired subject token still fails safely, since that
+response carries no usable ``resource_metadata`` to retry against.
 """
 
 from __future__ import annotations
@@ -41,6 +67,8 @@ import time
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
+from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -58,7 +86,44 @@ ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
 # agent's code.
 _DENIAL_ERROR_CODES = frozenset({"access_denied", "invalid_target", "invalid_scope", "invalid_request"})
 
+# MCP-gateway challenge error codes worth reacting to. insufficient_scope is
+# the RFC 9728-correct code for "right token, wrong scope"; invalid_token is
+# included because of the documented, not-yet-confirmed-fixed gateway bug
+# described in the module docstring. Anything else (or a challenge with no
+# resource_metadata) is returned to the caller as-is, not retried.
+_CHALLENGE_ERROR_CODES = frozenset({"insufficient_scope", "invalid_token"})
+
 _ERROR_BODY_SNIPPET_LEN = 200
+
+
+class UntrustedMetadataError(Exception):
+    """RFC 9728 protected-resource metadata failed to fetch or validate."""
+
+
+@dataclass(frozen=True)
+class _Challenge:
+    error: str | None
+    scope: str | None
+    resource_metadata: str | None
+
+
+def _parse_www_authenticate(header_value: str) -> _Challenge:
+    """Parse a ``WWW-Authenticate: Bearer error=..., scope=..., resource_metadata=...``
+    challenge header. Tolerant of quoting/spacing differences between servers."""
+    if not header_value:
+        return _Challenge(error=None, scope=None, resource_metadata=None)
+    _, _, rest = header_value.partition(" ")
+    params: dict[str, str] = {}
+    for part in rest.split(","):
+        if "=" not in part:
+            continue
+        key, _, value = part.partition("=")
+        params[key.strip().lower()] = value.strip().strip('"')
+    return _Challenge(
+        error=params.get("error"),
+        scope=params.get("scope"),
+        resource_metadata=params.get("resource_metadata"),
+    )
 
 
 class MissingSubjectTokenError(Exception):
@@ -171,59 +236,130 @@ class DelegatedTokenAuth(httpx.Auth):
         self._lock = asyncio.Lock()
 
     async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
-        token = await self._get_delegated_token()
+        token = await self._get_delegated_token(self._resource, self._scopes)
         logger.info(
             "[OBO] attaching delegated Bearer token to request -> %s %s (resource=%s)",
             request.method, request.url, self._resource,
         )
         request.headers["Authorization"] = f"Bearer {token}"
+        response = yield request
+
+        if response.status_code not in (401, 403):
+            return
+
+        challenge = _parse_www_authenticate(response.headers.get("WWW-Authenticate", ""))
+        if challenge.error not in _CHALLENGE_ERROR_CODES or not challenge.resource_metadata:
+            # Not a scope challenge this knows how to act on (e.g. a genuinely
+            # invalid/expired token with no resource_metadata) — surface the
+            # original response rather than guessing at a retry.
+            return
+
+        logger.warning(
+            "[OBO] got a %s challenge (error=%s) for resource='%s' — fetching its protected-resource "
+            "metadata and retrying once with the scope/resource it names",
+            response.status_code, challenge.error, self._resource,
+        )
+
+        try:
+            resource, retry_scopes = await self._resolve_challenge(challenge)
+        except UntrustedMetadataError:
+            logger.exception(
+                "[OBO][FAIL] refusing to retry — protected-resource metadata at '%s' failed validation",
+                challenge.resource_metadata,
+            )
+            return
+
+        try:
+            new_token = await self._get_delegated_token(resource, retry_scopes)
+        except (MissingSubjectTokenError, TokenExchangeError):
+            logger.exception("[OBO][FAIL] retry exchange failed for resource='%s'", resource)
+            return
+
+        request.headers["Authorization"] = f"Bearer {new_token}"
         yield request
 
-    async def _get_delegated_token(self) -> str:
+    async def _resolve_challenge(self, challenge: _Challenge) -> tuple[str, Sequence[str]]:
+        """Validate the challenge's RFC 9728 metadata and return the
+        (resource, scopes) to re-exchange for.
+
+        Refuses the metadata unless it is HTTPS, valid JSON, and advertises
+        exactly the resource this instance already targets — a resource
+        server cannot use its own challenge to redirect this agent into
+        minting a token for some other resource.
+        """
+        metadata_url = challenge.resource_metadata or ""
+        if urlsplit(metadata_url).scheme != "https":
+            raise UntrustedMetadataError(f"Refusing a non-HTTPS resource_metadata URL: {metadata_url!r}")
+
+        async with httpx.AsyncClient(timeout=10) as client:
+            try:
+                response = await client.get(metadata_url)
+            except httpx.HTTPError as exc:
+                raise UntrustedMetadataError(f"Failed to fetch resource_metadata: {exc}") from exc
+
+        if response.status_code != 200:
+            raise UntrustedMetadataError(f"resource_metadata endpoint returned {response.status_code}")
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise UntrustedMetadataError("resource_metadata response was not valid JSON") from exc
+
+        advertised_resource = data.get("resource") if isinstance(data, dict) else None
+        if advertised_resource != self._resource:
+            raise UntrustedMetadataError(
+                f"resource_metadata advertises resource {advertised_resource!r}, expected {self._resource!r}"
+            )
+
+        retry_scopes: Sequence[str] = (challenge.scope,) if challenge.scope else self._scopes
+        return advertised_resource, retry_scopes
+
+    async def _get_delegated_token(self, resource: str, scopes: Sequence[str]) -> str:
         subject_token = current_subject_token()
         if not subject_token:
             logger.error(
                 "[OBO][FAIL] no caller token in scope for resource='%s' — refusing to fall back to this "
                 "agent's own identity. Is Agent Manager forwarding the caller's token? (Agent ID -> "
                 "Delegated Access -> 'Token forwarding is enabled')",
-                self._resource,
+                resource,
             )
             raise MissingSubjectTokenError(
-                f"OBO exchange for resource {self._resource!r} attempted with no caller token in scope"
+                f"OBO exchange for resource {resource!r} attempted with no caller token in scope"
             )
 
-        cache_key = self._cache_key(subject_token)
+        cache_key = self._cache_key(subject_token, resource, scopes)
 
         async with self._lock:
             cached = self._cache.get(cache_key)
             if cached and time.monotonic() < cached[1]:
                 logger.info(
                     "[OBO] delegated token cache HIT for resource='%s' (expires in %.1fs)",
-                    self._resource, cached[1] - time.monotonic(),
+                    resource, cached[1] - time.monotonic(),
                 )
                 return cached[0]
 
             logger.info(
                 "[OBO] exchanging caller token for a delegated token — resource='%s' scopes=%s",
-                self._resource, self._scopes,
+                resource, scopes,
             )
-            access_token, expiry = await self._exchange(subject_token)
+            access_token, expiry = await self._exchange(subject_token, resource, scopes)
             self._cache[cache_key] = (access_token, expiry)
             return access_token
 
-    def _cache_key(self, subject_token: str) -> str:
+    @staticmethod
+    def _cache_key(subject_token: str, resource: str, scopes: Sequence[str]) -> str:
         digest = hashlib.sha256(subject_token.encode("utf-8")).hexdigest()
-        return f"{digest}|{self._resource}|{','.join(sorted(self._scopes))}"
+        return f"{digest}|{resource}|{','.join(sorted(scopes))}"
 
-    async def _exchange(self, subject_token: str) -> tuple[str, float]:
+    async def _exchange(self, subject_token: str, resource: str, scopes: Sequence[str]) -> tuple[str, float]:
         form: dict[str, str] = {
             "grant_type": TOKEN_EXCHANGE_GRANT_TYPE,
             "subject_token": subject_token,
             "subject_token_type": ACCESS_TOKEN_TYPE,
-            "resource": self._resource,
+            "resource": resource,
         }
-        if self._scopes:
-            form["scope"] = " ".join(self._scopes)
+        if scopes:
+            form["scope"] = " ".join(scopes)
 
         try:
             async with httpx.AsyncClient(timeout=10) as client:
@@ -233,14 +369,14 @@ class DelegatedTokenAuth(httpx.Auth):
                     auth=(settings.agentid_client_id, settings.agentid_client_secret),
                 )
         except httpx.TimeoutException as exc:
-            logger.error("[OBO][FAIL] token endpoint timed out for resource='%s'", self._resource)
+            logger.error("[OBO][FAIL] token endpoint timed out for resource='%s'", resource)
             raise TokenExchangeError(f"Token endpoint timed out: {exc}") from exc
         except httpx.HTTPError as exc:
-            logger.error("[OBO][FAIL] token endpoint request failed for resource='%s': %s", self._resource, exc)
+            logger.error("[OBO][FAIL] token endpoint request failed for resource='%s': %s", resource, exc)
             raise TokenExchangeError(f"Token endpoint request failed: {exc}") from exc
 
         if response.status_code != 200:
-            raise self._error_for_response(response)
+            raise self._error_for_response(response, resource)
 
         try:
             payload = response.json()
@@ -257,11 +393,11 @@ class DelegatedTokenAuth(httpx.Auth):
         expiry = time.monotonic() + (expires_in * 0.75)
         logger.info(
             "[OBO][OK] delegated token minted for resource='%s' scope='%s' expires_in=%s",
-            self._resource, payload.get("scope"), expires_in,
+            resource, payload.get("scope"), expires_in,
         )
         return access_token, expiry
 
-    def _error_for_response(self, response: httpx.Response) -> TokenExchangeError:
+    def _error_for_response(self, response: httpx.Response, resource: str) -> TokenExchangeError:
         error_code: str | None = None
         error_description: str | None = None
         try:
@@ -275,12 +411,12 @@ class DelegatedTokenAuth(httpx.Auth):
         detail = error_description or (response.text or "")[:_ERROR_BODY_SNIPPET_LEN]
         logger.error(
             "[OBO][FAIL] token endpoint returned %s for resource='%s': error=%s description=%s",
-            response.status_code, self._resource, error_code, detail,
+            response.status_code, resource, error_code, detail,
         )
 
         if error_code in _DENIAL_ERROR_CODES:
             return DelegationDeniedError(
-                f"Delegated access denied for resource {self._resource!r} "
+                f"Delegated access denied for resource {resource!r} "
                 f"(error={error_code!r}): {detail}. Check: the AgentID's token-exchange grant is "
                 "enabled, a trusted issuer connection is enabled for this environment, and it has an "
                 "authorization mapping covering this caller's token.",

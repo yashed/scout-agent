@@ -1,34 +1,30 @@
 """OBO (On-Behalf-Of) flow tester — a local debugging UI, not a deployable agent.
 
-Walks the real flow end to end, with every step visible:
+Does exactly three things, visibly:
 
-  1. Sign in at a real external IdP (Okta) via a genuine Authorization Code +
-     PKCE redirect — this app's own URL is the redirect_uri, so the OAuth
-     callback lands back here automatically.
-  2. Decode the caller's access token and show exactly what's in it,
-     including the `typ` header, since that header's absence/shape is what
-     actually gates whether ThunderID will accept the token at all (see
-     scout-agent's own obo_identity.py docstring for why).
-  3. Optionally run the RFC 8693 token-exchange call *directly from this
-     app*, authenticating as the AgentID, so you can watch the literal
-     request/response ThunderID sees — this mirrors obo_identity.py's
-     _exchange() exactly, it does not call into Scout's code, it duplicates
-     the same wire call so the exchange is visible independently of
-     whatever Scout itself logs.
-  4. Call the deployed Scout agent's real /chat endpoint with the caller's
-     token, so Scout performs its own internal exchange exactly as it would
-     for a real caller, and shows the actual response.
+  1. Signs you in at a real external IdP (e.g. Okta) via an actual
+     Authorization Code + PKCE redirect — this app's own URL is the OAuth
+     redirect_uri, so the callback lands back here automatically.
+  2. Decodes the resulting caller token and shows its header and payload,
+     flagging whether its `typ` header would satisfy ThunderID's RFC 9068
+     check if declared as `access_token` (most real IdPs' tokens won't —
+     see ../obo_identity.py's module docstring for why that's fine).
+  3. Calls the deployed Scout agent's real `/chat` endpoint with that
+     caller token. Scout performs its own internal RFC 8693 token exchange
+     against ThunderID exactly as it would for any real caller — this app
+     never touches that exchange directly, it only calls the public
+     endpoint, the same way any real application would.
 
-Every action appends to a single running log so the whole session reads
-back as one narrated trace.
+Every action is appended to a running log panel so the whole session reads
+back as one trace.
 """
 
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import secrets
+import hashlib
 import time
 import uuid
 from datetime import datetime, timezone
@@ -39,20 +35,14 @@ import streamlit as st
 
 st.set_page_config(page_title="OBO Flow Tester", layout="wide")
 
-SUBJECT_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:jwt"
-TOKEN_EXCHANGE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:token-exchange"
-
 # ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
 _DEFAULTS = {
     "log": [],
     "caller_token": None,
-    "caller_token_response": None,
     "pkce_verifier": None,
     "oauth_state": None,
-    "delegated_token": None,
-    "delegated_token_response": None,
     "chat_response": None,
     "session_id": str(uuid.uuid4()),
 }
@@ -77,7 +67,7 @@ def log_request(method: str, url: str, headers: dict, data: dict | None = None) 
         safe_data = dict(data)
         for sensitive in ("subject_token", "client_secret", "code_verifier"):
             if sensitive in safe_data:
-                safe_data[sensitive] = safe_data[sensitive][:12] + "...<redacted>"
+                safe_data[sensitive] = str(safe_data[sensitive])[:12] + "...<redacted>"
         log("REQ", f"  body: {json.dumps(safe_data)}")
 
 
@@ -111,7 +101,7 @@ def make_pkce_pair() -> tuple[str, str]:
 # Sidebar — configuration (nothing here is persisted to disk)
 # ---------------------------------------------------------------------------
 st.sidebar.header("Configuration")
-st.sidebar.caption("Local testing tool. Secrets stay in this browser session only, never written to disk.")
+st.sidebar.caption("Local testing tool. Nothing entered here is written to disk.")
 
 st.sidebar.subheader("1. External IdP (Okta)")
 okta_issuer = st.sidebar.text_input(
@@ -129,25 +119,9 @@ okta_audience = st.sidebar.text_input(
     key="okta_audience",
 )
 
-st.sidebar.subheader("2. AgentID (for the exchange demo)")
-agentid_token_endpoint = st.sidebar.text_input(
-    "Thunder token endpoint", placeholder="https://.../oauth2/token", key="agentid_token_endpoint"
-)
-agentid_client_id = st.sidebar.text_input("AgentID client ID", key="agentid_client_id")
-agentid_client_secret = st.sidebar.text_input(
-    "AgentID client secret", type="password", key="agentid_client_secret"
-)
-agentid_resource = st.sidebar.text_input(
-    "Resource (the MCP proxy URL this agent's own client_credentials auth already uses)",
-    key="agentid_resource",
-)
-agentid_scopes = st.sidebar.text_input(
-    "Scopes to request (space-separated, e.g. test:read)", key="agentid_scopes"
-)
-
-st.sidebar.subheader("3. Scout agent")
+st.sidebar.subheader("2. Scout agent")
 scout_chat_url = st.sidebar.text_input(
-    "Chat endpoint", placeholder="https://your-scout-agent/chat", key="scout_chat_url"
+    "Chat endpoint", placeholder="http://<gateway-host>/<agent>/chat", key="scout_chat_url"
 )
 
 if st.sidebar.button("Reset everything"):
@@ -183,7 +157,6 @@ if "code" in params and st.session_state["caller_token"] is None:
             resp.raise_for_status()
             body = resp.json()
             st.session_state["caller_token"] = body["access_token"]
-            st.session_state["caller_token_response"] = body
             log("OK", "Caller token minted")
         except Exception as exc:
             log("FAIL", f"code exchange failed: {exc}")
@@ -191,10 +164,27 @@ if "code" in params and st.session_state["caller_token"] is None:
     st.rerun()
 
 # ---------------------------------------------------------------------------
-# Layout
+# Flow status tracker
 # ---------------------------------------------------------------------------
 st.title("OBO Flow Tester")
-st.caption("Drives the real external sign-in, shows the real RFC 8693 exchange, calls the real Scout agent.")
+st.caption("Signs in at the real IdP, calls the real deployed Scout agent, visualizes every step.")
+
+step1_done = bool(st.session_state["caller_token"])
+step2_done = step1_done
+step3_done = bool(st.session_state["chat_response"] and st.session_state["chat_response"]["status"] == 200)
+
+cols = st.columns(4)
+steps = [
+    ("1. Sign in", step1_done),
+    ("2. Decode token", step2_done),
+    ("3. Call Scout", step3_done),
+    ("4. Response", step3_done),
+]
+for col, (label, done) in zip(cols, steps):
+    with col:
+        st.markdown(f"{'🟢' if done else '⚪'} **{label}**")
+
+st.divider()
 
 col_main, col_log = st.columns([3, 2])
 
@@ -240,17 +230,17 @@ with col_main:
             st.json(header)
             typ = header.get("typ")
             if typ in (None, ""):
-                st.warning("No `typ` header — ThunderID will still accept this if the exchange "
-                           "declares subject_token_type as the generic `jwt` type, not `access_token`.")
+                st.warning("No `typ` header — Scout's own exchange code declares the subject token as the "
+                           "generic `jwt` type specifically to handle this, so this is expected and fine.")
             elif typ not in ("at+jwt", "application/at+jwt"):
-                st.warning(f"typ is {typ!r}, not the RFC 9068 `at+jwt` — same situation as above.")
+                st.warning(f"typ is {typ!r}, not the RFC 9068 `at+jwt` — same situation as above, still fine.")
             else:
-                st.success("typ is RFC 9068-compliant — would pass even if declared as access_token.")
+                st.success("typ is RFC 9068-compliant.")
         with c2:
             st.caption("Payload")
             st.json(payload)
         remaining = payload.get("exp", 0) - time.time()
-        st.caption(f"Expires in {max(0, int(remaining))}s" if remaining > 0 else "Expired")
+        st.caption(f"Expires in {max(0, int(remaining))}s" if remaining > 0 else "Expired — sign in again")
         with st.expander("Raw token"):
             st.code(st.session_state["caller_token"], language=None)
     else:
@@ -263,68 +253,8 @@ with col_main:
                 st.rerun()
 
     st.divider()
-    st.header("3. Watch the token exchange (RFC 8693)")
-    st.caption(
-        "Calls Thunder's token endpoint directly with the AgentID's own credentials, "
-        "exactly the same wire call Scout's own code makes internally — purely so you "
-        "can see the request/response, not required before step 4."
-    )
-    can_exchange = bool(
-        st.session_state["caller_token"] and agentid_token_endpoint and agentid_client_id
-        and agentid_client_secret and agentid_resource
-    )
-    if not can_exchange:
-        st.info("Need a caller token plus the AgentID fields in the sidebar.")
-    if st.button("Run token exchange", disabled=not can_exchange):
-        form = {
-            "grant_type": TOKEN_EXCHANGE_GRANT_TYPE,
-            "subject_token": st.session_state["caller_token"],
-            "subject_token_type": SUBJECT_TOKEN_TYPE,
-            "resource": agentid_resource,
-        }
-        if agentid_scopes.strip():
-            form["scope"] = agentid_scopes.strip()
-        log("INFO", "Running RFC 8693 token exchange against Thunder")
-        log_request(
-            "POST", agentid_token_endpoint,
-            {"content-type": "application/x-www-form-urlencoded", "Authorization": "Basic <agentid-creds>"},
-            form,
-        )
-        try:
-            resp = requests.post(
-                agentid_token_endpoint, data=form,
-                auth=(agentid_client_id, agentid_client_secret), timeout=10,
-            )
-            log_response(resp)
-            body = resp.json()
-            if resp.status_code == 200:
-                st.session_state["delegated_token"] = body.get("access_token")
-                st.session_state["delegated_token_response"] = body
-                log("OK", "Delegated token minted")
-            else:
-                st.session_state["delegated_token_response"] = body
-                error = body.get("error")
-                hint = {
-                    "access_denied": "No matching authorization mapping for this caller's claims.",
-                    "invalid_target": "The `resource` value doesn't match a registered resource server.",
-                    "invalid_scope": "The requested scope isn't granted by the mapped role.",
-                    "invalid_request": "Check subject_token_type and that all required fields are present.",
-                }.get(error, "")
-                log("FAIL", f"exchange denied: {error} — {body.get('error_description', '')}. {hint}")
-        except Exception as exc:
-            log("FAIL", f"exchange request failed: {exc}")
-
-    if st.session_state["delegated_token_response"]:
-        st.caption("Response")
-        st.json(st.session_state["delegated_token_response"])
-        if st.session_state["delegated_token"]:
-            d_header, d_payload = decode_jwt(st.session_state["delegated_token"])
-            st.caption("Decoded delegated token — look for sub=caller, act=AgentID, aud=resource")
-            st.json({"header": d_header, "payload": d_payload})
-
-    st.divider()
-    st.header("4. Call Scout agent for real")
-    st.caption("Scout performs its own internal exchange here — this is the real end-to-end path.")
+    st.header("3. Call Scout agent for real")
+    st.caption("Scout performs its own internal RFC 8693 exchange here — this is the real end-to-end test.")
     message = st.text_input("Message", value="Fetch https://example.com and summarize it.")
     session_id = st.text_input("Session ID", value=st.session_state["session_id"])
     can_chat = bool(st.session_state["caller_token"] and scout_chat_url)
@@ -348,6 +278,7 @@ with col_main:
                 log("FAIL", f"Scout returned {resp.status_code}")
         except Exception as exc:
             log("FAIL", f"chat request failed: {exc}")
+            st.session_state["chat_response"] = {"status": 0, "body": str(exc)}
 
     if st.session_state["chat_response"]:
         resp_data = st.session_state["chat_response"]

@@ -77,7 +77,25 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 TOKEN_EXCHANGE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:token-exchange"
-ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
+
+# Deliberately the generic RFC 8693 "this is a JWT" identifier, not
+# urn:ietf:params:oauth:token-type:access_token. Confirmed against
+# ThunderID's own grant handler (token_exchange.go's validateAccessTokenType):
+# that function enforces the RFC 9068 `at+jwt`/`application/at+jwt` typ
+# header on the subject token, but ONLY when subject_token_type is declared
+# as access_token — every other validation step (issuer trust, audience,
+# signature, claims/authorization mapping) behaves identically regardless of
+# which valid type is declared. Real external IdPs commonly don't set that
+# header: Okta's org authorization server uses its own internal typ value,
+# and Okta's custom authorization servers (the kind documented for
+# third-party API access tokens) omit typ entirely, both confirmed live
+# against a real Okta tenant. Declaring access_token here would make every
+# caller token from either kind of Okta authorization server fail with
+# "not an access token (missing at+jwt typ header)" despite being a
+# perfectly valid, correctly signed JWT — declaring it as the generic jwt
+# type describes what the token actually is and lets ThunderID's identical
+# downstream validation run as intended.
+SUBJECT_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:jwt"
 
 # ThunderID error codes that mean the exchange request reached the server and
 # was well-formed, but this caller simply has no path to the requested
@@ -355,7 +373,7 @@ class DelegatedTokenAuth(httpx.Auth):
         form: dict[str, str] = {
             "grant_type": TOKEN_EXCHANGE_GRANT_TYPE,
             "subject_token": subject_token,
-            "subject_token_type": ACCESS_TOKEN_TYPE,
+            "subject_token_type": SUBJECT_TOKEN_TYPE,
             "resource": resource,
         }
         if scopes:

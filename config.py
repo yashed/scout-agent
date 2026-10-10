@@ -46,6 +46,18 @@ class Settings(BaseSettings):
     agentid_token_endpoint: str = Field(default="", validation_alias="AMP_AGENTID_TOKEN_ENDPOINT")
     agentid_scopes: str = Field(default="", validation_alias="AMP_AGENTID_SCOPES")
 
+    # OBO (On-Behalf-Of / delegated access). When true, MCP calls exchange the
+    # caller's own forwarded access token (RFC 8693 token exchange) for a
+    # token scoped to the target resource, instead of using this agent's own
+    # client_credentials identity. Requires: this agent's "Token-exchange
+    # grant" enabled, a trusted issuer connection enabled for the environment
+    # with an authorization mapping, and (for actual scopes to be granted,
+    # see obo_identity.py's module docstring) the per-proxy scopes below set
+    # to real scopes that mapping grants.
+    obo_enabled: bool = Field(default=False, validation_alias="AMP_OBO_ENABLED")
+    fetch_obo_scopes: str = Field(default="", validation_alias="FETCH_OBO_SCOPES")
+    deepwiki_obo_scopes: str = Field(default="", validation_alias="DEEPWIKI_OBO_SCOPES")
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
@@ -91,6 +103,9 @@ def dump_settings() -> None:
     logger.info("  AMP_AGENTID_CLIENT_SECRET  = %s", settings.agentid_client_secret if settings.agentid_client_secret else "(unset)")
     logger.info("  AMP_AGENTID_TOKEN_ENDPOINT = %s", settings.agentid_token_endpoint if settings.agentid_token_endpoint else "(unset)")
     logger.info("  AMP_AGENTID_SCOPES         = %s", settings.agentid_scopes if settings.agentid_scopes else "(unset)")
+    logger.info("  AMP_OBO_ENABLED            = %s", settings.obo_enabled)
+    logger.info("  FETCH_OBO_SCOPES           = %s", settings.fetch_obo_scopes if settings.fetch_obo_scopes else "(unset)")
+    logger.info("  DEEPWIKI_OBO_SCOPES        = %s", settings.deepwiki_obo_scopes if settings.deepwiki_obo_scopes else "(unset)")
     logger.info("=" * 70)
 
     # Quick validation checks
@@ -150,5 +165,27 @@ def dump_settings() -> None:
             "Bearer token auth will be SKIPPED. MCP calls may fail with 401 if the gateway requires it.",
             ", ".join(missing),
         )
+
+    # OBO validation
+    if settings.obo_enabled:
+        if agentid_all_set:
+            logger.info("  [OK]    AMP_OBO_ENABLED is true — MCP calls will use delegated (OBO) access")
+        else:
+            logger.warning(
+                "  [FAIL]  AMP_OBO_ENABLED is true but AgentID credentials are NOT set — "
+                "OBO exchange cannot authenticate as this agent and every tool call will fail"
+            )
+        if not settings.fetch_obo_scopes and settings.fetch_mcp_url:
+            logger.warning(
+                "  [WARN]  FETCH_OBO_SCOPES is unset — ThunderID grants no permission scopes for a "
+                "mapping-based exchange with no requested scope, so Fetch calls will likely come back "
+                "with an empty-scope token"
+            )
+        if not settings.deepwiki_obo_scopes and settings.deepwiki_mcp_url:
+            logger.warning(
+                "  [WARN]  DEEPWIKI_OBO_SCOPES is unset — same as above, for DeepWiki"
+            )
+    else:
+        logger.info("  [INFO]  AMP_OBO_ENABLED is false — MCP calls use this agent's own client_credentials identity")
 
     logger.info("=" * 70)

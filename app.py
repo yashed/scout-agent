@@ -18,13 +18,14 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Request, status
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field, field_validator
 
 from config import dump_all_env_vars, dump_settings
 from graph import build_graph
 from mcp_tools import load_mcp_tools
+from obo_identity import extract_bearer_token, obo_enabled, subject_token_scope
 from tools import NATIVE_TOOLS
 
 # ---------------------------------------------------------------------------
@@ -120,22 +121,38 @@ def _wrap_user_message(user_message: str, context: dict[str, Any]) -> str:
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest) -> ChatResponse:
+async def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
+    # The caller's own access token, forwarded by Agent Manager's gateway when
+    # this agent's "Invocation security is OAuth" + "Token forwarding" are
+    # both enabled (see Agent ID -> Delegated Access in the console). Only
+    # its presence is logged, never the token itself — unlike this agent's
+    # own static AMP_AGENTID_* secret, this is a live caller credential.
+    subject_token = extract_bearer_token(http_request.headers.get("authorization"))
     logger.info(
-        "[DEBUG] /chat called — session_id='%s' | message_len=%d | context_keys=%s",
+        "[DEBUG] /chat called — session_id='%s' | message_len=%d | context_keys=%s | "
+        "caller_token=%s | obo_enabled=%s",
         request.session_id,
         len(request.message),
         list(request.context.keys()),
+        "present" if subject_token else "absent",
+        obo_enabled(),
     )
+    if obo_enabled() and not subject_token:
+        logger.warning(
+            "[OBO][WARN] AMP_OBO_ENABLED is true but this request carried no caller Bearer token — "
+            "any tool call this turn makes will fail with MissingSubjectTokenError rather than "
+            "silently running as this agent's own identity"
+        )
     wrapped_message = _wrap_user_message(request.message, request.context)
     try:
-        result = await agent_graph.ainvoke(
-            {"messages": [HumanMessage(content=wrapped_message)]},
-            config={
-                "recursion_limit": 50,
-                "configurable": {"thread_id": request.session_id},
-            },
-        )
+        with subject_token_scope(subject_token):
+            result = await agent_graph.ainvoke(
+                {"messages": [HumanMessage(content=wrapped_message)]},
+                config={
+                    "recursion_limit": 50,
+                    "configurable": {"thread_id": request.session_id},
+                },
+            )
     except Exception:
         logger.exception("chat invoke failed: session_id=%s", request.session_id)
         raise HTTPException(

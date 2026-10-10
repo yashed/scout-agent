@@ -1,0 +1,294 @@
+"""OBO (On-Behalf-Of) token exchange for platform-hosted agents.
+
+This is a plain, from-scratch implementation of RFC 8693 OAuth 2.0 Token
+Exchange against ThunderID's token endpoint — it deliberately does not depend
+on the `amp_identity` runtime package (see
+`.worktrees/obo-direct/*/libs/amp-identity`); it exists so Scout's own code
+demonstrates the wire protocol end to end.
+
+The request shape below (parameter names, which ones ThunderID actually
+honors, the Basic-auth client authentication) is confirmed against ThunderID's
+own grant handler
+(`backend/internal/oauth/oauth2/granthandlers/token_exchange.go` and
+`backend/internal/oauth/oauth2/constants/constants.go` in the thunderid repo),
+not assumed from the RFC alone:
+
+- ``resource`` (RFC 8707) is the parameter ThunderID resolves against its
+  registered resource servers. It must be the *same* resource identifier
+  already used for this agent's own client_credentials calls (see
+  ``agent_identity.py``) — for Scout that's each MCP proxy's configured URL.
+  ``audience`` is accepted on the wire but explicitly NOT honored by the
+  token-exchange grant handler, so this never sends it.
+- ``scope`` is not optional in practice: when the trusted issuer's
+  authorization is mapping-based (an "authorization mapping" rule, exactly
+  what Agent Manager's Connections page configures) and ``scope`` is omitted,
+  ThunderID's handler treats the request as asking for nothing and grants
+  nothing. Which scopes to request per resource is configured below via
+  ``<PROXY>_OBO_SCOPES`` env vars.
+- The caller's own token (the ``subject_token``) must be the live request's
+  forwarded ``Authorization: Bearer <token>`` header — this only exists when
+  Agent Manager's "Invocation security is OAuth" + "Token forwarding" are
+  both enabled for this agent (see the Agent ID -> Delegated Access readiness
+  checklist in the console).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import logging
+import time
+from collections.abc import AsyncGenerator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
+
+import httpx
+
+from config import settings
+
+logger = logging.getLogger(__name__)
+
+TOKEN_EXCHANGE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:token-exchange"
+ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
+
+# ThunderID error codes that mean the exchange request reached the server and
+# was well-formed, but this caller simply has no path to the requested
+# access (no trusted issuer, no matching mapping, scope not granted) — an
+# expected, fail-closed denial, not a transport failure or a bug in this
+# agent's code.
+_DENIAL_ERROR_CODES = frozenset({"access_denied", "invalid_target", "invalid_scope", "invalid_request"})
+
+_ERROR_BODY_SNIPPET_LEN = 200
+
+
+class MissingSubjectTokenError(Exception):
+    """Raised when an OBO exchange is attempted with no caller token in scope.
+
+    This is a hard failure by design: silently falling back to the agent's
+    own client_credentials identity would defeat the point of delegated
+    access (the call would run as the agent, not as the caller), so there is
+    no fallback path here.
+    """
+
+
+class TokenExchangeError(Exception):
+    """The token endpoint rejected or failed the exchange."""
+
+    def __init__(self, message: str, *, status_code: int | None = None, error_code: str | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_code = error_code
+
+
+class DelegationDeniedError(TokenExchangeError):
+    """The exchange was well-formed but denied: no trust/mapping/scope path."""
+
+
+# ---------------------------------------------------------------------------
+# Per-request subject token context
+#
+# Scout builds its MCP tool clients once at process startup (see
+# mcp_tools.py), but the caller's token is only known per /chat request. A
+# ContextVar bridges the two: app.py sets it for the lifetime of one
+# agent_graph.ainvoke(...) call, and DelegatedTokenAuth (below) reads it
+# whenever LangGraph's ToolNode actually makes an MCP call, however deep in
+# the call stack that happens. ContextVar values propagate automatically into
+# tasks created from within the `with` block (asyncio copies the current
+# context at task-creation time), so this holds even through LangGraph's
+# internal async scheduling.
+# ---------------------------------------------------------------------------
+_current_subject_token: ContextVar[str | None] = ContextVar("obo_subject_token", default=None)
+
+
+def extract_bearer_token(authorization_header: str | None) -> str | None:
+    """Parse an inbound ``Authorization: Bearer <token>`` header.
+
+    Returns None (not an error) for a missing header or a non-Bearer scheme —
+    callers decide whether that's fine (a conversational message that never
+    touches a tool) or fatal (a tool call is attempted with no caller
+    identity available, see MissingSubjectTokenError).
+    """
+    if not authorization_header:
+        return None
+    scheme, _, value = authorization_header.partition(" ")
+    if scheme.lower() != "bearer":
+        return None
+    token = value.strip()
+    return token or None
+
+
+@contextmanager
+def subject_token_scope(token: str | None):
+    """Make ``token`` the active caller identity for every OBO exchange made
+    inside this block, in this task and any task spawned from inside it."""
+    reset: Token[str | None] = _current_subject_token.set(token)
+    try:
+        yield
+    finally:
+        _current_subject_token.reset(reset)
+
+
+def current_subject_token() -> str | None:
+    return _current_subject_token.get()
+
+
+def obo_enabled() -> bool:
+    """Whether this deployment should attempt delegated (OBO) access at all.
+
+    Reuses the same AMP_AGENTID_* credentials/endpoint as the existing
+    client_credentials path (agent_identity.py): token exchange authenticates
+    as this agent's own AgentID exactly like client_credentials does, it only
+    changes the grant_type and adds the caller's subject_token.
+    """
+    from agent_identity import agent_identity_configured
+
+    return settings.obo_enabled and agent_identity_configured()
+
+
+class DelegatedTokenAuth(httpx.Auth):
+    """Attaches a delegated (OBO) bearer token to every MCP request for one
+    resource, exchanging the current request's caller token for one scoped
+    to that resource via RFC 8693 token exchange.
+
+    One instance per MCP proxy, same as AgentIdentityAuth, and for the same
+    reason: a token exchange binds to one target resource server, so proxies
+    cannot share a cache.
+
+    There is deliberately no fallback to the agent's own identity: a tool
+    call made without an active caller token raises MissingSubjectTokenError
+    rather than silently running as the agent instead of the user.
+    """
+
+    def __init__(self, resource: str, scopes: Sequence[str] = ()) -> None:
+        self._resource = resource
+        self._scopes = tuple(scopes)
+        # Cache keyed by (hash of caller token, resource, scopes): the same
+        # caller re-invoking the same tool within the token's lifetime reuses
+        # the exchanged token instead of re-exchanging on every call. The
+        # subject token itself is hashed, never stored or logged, since it's
+        # a live caller credential, not this agent's own static secret.
+        self._cache: dict[str, tuple[str, float]] = {}
+        self._lock = asyncio.Lock()
+
+    async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
+        token = await self._get_delegated_token()
+        logger.info(
+            "[OBO] attaching delegated Bearer token to request -> %s %s (resource=%s)",
+            request.method, request.url, self._resource,
+        )
+        request.headers["Authorization"] = f"Bearer {token}"
+        yield request
+
+    async def _get_delegated_token(self) -> str:
+        subject_token = current_subject_token()
+        if not subject_token:
+            logger.error(
+                "[OBO][FAIL] no caller token in scope for resource='%s' — refusing to fall back to this "
+                "agent's own identity. Is Agent Manager forwarding the caller's token? (Agent ID -> "
+                "Delegated Access -> 'Token forwarding is enabled')",
+                self._resource,
+            )
+            raise MissingSubjectTokenError(
+                f"OBO exchange for resource {self._resource!r} attempted with no caller token in scope"
+            )
+
+        cache_key = self._cache_key(subject_token)
+
+        async with self._lock:
+            cached = self._cache.get(cache_key)
+            if cached and time.monotonic() < cached[1]:
+                logger.info(
+                    "[OBO] delegated token cache HIT for resource='%s' (expires in %.1fs)",
+                    self._resource, cached[1] - time.monotonic(),
+                )
+                return cached[0]
+
+            logger.info(
+                "[OBO] exchanging caller token for a delegated token — resource='%s' scopes=%s",
+                self._resource, self._scopes,
+            )
+            access_token, expiry = await self._exchange(subject_token)
+            self._cache[cache_key] = (access_token, expiry)
+            return access_token
+
+    def _cache_key(self, subject_token: str) -> str:
+        digest = hashlib.sha256(subject_token.encode("utf-8")).hexdigest()
+        return f"{digest}|{self._resource}|{','.join(sorted(self._scopes))}"
+
+    async def _exchange(self, subject_token: str) -> tuple[str, float]:
+        form: dict[str, str] = {
+            "grant_type": TOKEN_EXCHANGE_GRANT_TYPE,
+            "subject_token": subject_token,
+            "subject_token_type": ACCESS_TOKEN_TYPE,
+            "resource": self._resource,
+        }
+        if self._scopes:
+            form["scope"] = " ".join(self._scopes)
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(
+                    settings.agentid_token_endpoint,
+                    data=form,
+                    auth=(settings.agentid_client_id, settings.agentid_client_secret),
+                )
+        except httpx.TimeoutException as exc:
+            logger.error("[OBO][FAIL] token endpoint timed out for resource='%s'", self._resource)
+            raise TokenExchangeError(f"Token endpoint timed out: {exc}") from exc
+        except httpx.HTTPError as exc:
+            logger.error("[OBO][FAIL] token endpoint request failed for resource='%s': %s", self._resource, exc)
+            raise TokenExchangeError(f"Token endpoint request failed: {exc}") from exc
+
+        if response.status_code != 200:
+            raise self._error_for_response(response)
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise TokenExchangeError("Token endpoint response was not valid JSON") from exc
+
+        access_token = payload.get("access_token")
+        expires_in = payload.get("expires_in")
+        if not access_token or not isinstance(expires_in, (int, float)):
+            raise TokenExchangeError("Token endpoint response is missing access_token/expires_in")
+
+        # Refresh at 75% of the token's lifetime, matching agent_identity.py's
+        # existing client_credentials cache so both auth paths behave the same way.
+        expiry = time.monotonic() + (expires_in * 0.75)
+        logger.info(
+            "[OBO][OK] delegated token minted for resource='%s' scope='%s' expires_in=%s",
+            self._resource, payload.get("scope"), expires_in,
+        )
+        return access_token, expiry
+
+    def _error_for_response(self, response: httpx.Response) -> TokenExchangeError:
+        error_code: str | None = None
+        error_description: str | None = None
+        try:
+            body = response.json()
+            if isinstance(body, dict):
+                error_code = body.get("error")
+                error_description = body.get("error_description")
+        except ValueError:
+            pass
+
+        detail = error_description or (response.text or "")[:_ERROR_BODY_SNIPPET_LEN]
+        logger.error(
+            "[OBO][FAIL] token endpoint returned %s for resource='%s': error=%s description=%s",
+            response.status_code, self._resource, error_code, detail,
+        )
+
+        if error_code in _DENIAL_ERROR_CODES:
+            return DelegationDeniedError(
+                f"Delegated access denied for resource {self._resource!r} "
+                f"(error={error_code!r}): {detail}. Check: the AgentID's token-exchange grant is "
+                "enabled, a trusted issuer connection is enabled for this environment, and it has an "
+                "authorization mapping covering this caller's token.",
+                status_code=response.status_code,
+                error_code=error_code,
+            )
+        return TokenExchangeError(
+            f"Token endpoint returned {response.status_code}: {detail}",
+            status_code=response.status_code,
+            error_code=error_code,
+        )

@@ -29,6 +29,8 @@ loop.
 | `graph.py` | LangGraph `StateGraph` wiring the LLM and tools together |
 | `app.py` | FastAPI entrypoint: `/chat`, `/health` |
 | `main.py` | Local runner (`python main.py`) |
+| `agent_identity.py` | Mints/caches this agent's own client_credentials bearer token |
+| `obo_identity.py` | RFC 8693 token exchange for delegated (OBO) MCP access — see below |
 
 ## Prerequisites
 
@@ -143,6 +145,54 @@ Sample prompts covering every tool:
 If a proxy isn't attached yet, Scout still starts (see the startup log line
 listing loaded tools) — it just answers with native tools only and says so if
 asked to fetch a page or query DeepWiki.
+
+## Delegated access (OBO)
+
+By default Scout calls MCP proxies acting as its own AgentID
+(`client_credentials`, see `agent_identity.py`). Setting `AMP_OBO_ENABLED=true`
+switches it to delegated (On-Behalf-Of) access instead: every `/chat` request
+forwards the caller's own access token, Scout exchanges it (RFC 8693 token
+exchange, implemented from scratch in `obo_identity.py` — no runtime library
+dependency) for a token scoped to the specific MCP resource, and calls that
+proxy acting as the caller rather than as itself.
+
+This is a security-relevant mode change, so it fails closed: if
+`AMP_OBO_ENABLED=true` and a `/chat` request arrives with no caller token
+forwarded, Scout does **not** fall back to its own identity — the tool call
+raises `MissingSubjectTokenError` instead.
+
+### Setup, in Agent Manager's console
+
+1. **Configure -> Invocation Security**: enable OAuth, and enable token
+   forwarding — this is what puts the caller's token on the `/chat` request
+   Scout receives.
+2. **Agent ID -> Delegated Access (OBO)**: work through the readiness
+   checklist (a trusted issuer Connection enabled for the environment, with
+   an authorization mapping rule covering your test caller; at least one
+   resource/scope added to this agent's Delegation Ceiling), then flip
+   **Enable Delegated Access** once every row is satisfied.
+3. Set `AMP_OBO_ENABLED=true` and `FETCH_OBO_SCOPES` / `DEEPWIKI_OBO_SCOPES`
+   (space-separated) to the scope(s) your authorization mapping's target role
+   actually grants for that resource — see the `.env.example` comment for why
+   this can't be left blank.
+4. Call Scout through something that actually forwards a real end-user
+   token (an Application invoking it through the gateway, not the console's
+   own Try It panel, which calls as the logged-in admin's own session).
+
+### Troubleshooting
+
+- `MissingSubjectTokenError` — no caller token reached Scout. Check token
+  forwarding is enabled on the agent's invocation security config, and that
+  whatever is calling Scout is itself presenting a real OAuth access token.
+- `DelegationDeniedError` (ThunderID `access_denied` / `invalid_target` /
+  `invalid_scope`) — the exchange reached ThunderID and was rejected: check
+  the token-exchange grant is enabled on this AgentID, the trusted connection
+  is enabled, and its authorization mapping actually covers the caller's
+  token claims.
+- An exchange that succeeds but the MCP call still gets a 403 — almost always
+  `FETCH_OBO_SCOPES`/`DEEPWIKI_OBO_SCOPES` not matching a scope the mapped
+  role actually grants (see `obo_identity.py`'s module docstring on why an
+  empty `scope` request grants nothing, it's not "all allowed scopes").
 
 ## Observing traces
 

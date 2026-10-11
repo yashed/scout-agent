@@ -65,6 +65,7 @@ import hashlib
 import json
 import logging
 import time
+import uuid
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
@@ -255,13 +256,30 @@ _current_subject_token: ContextVar[str | None] = ContextVar("obo_subject_token",
 # ordinary tool failures ("that URL doesn't exist"), but it means a genuine
 # authorization failure would otherwise reach the caller as free-form text in
 # a 200 OK response, not the "stable authorization_required or access_denied
-# result" delegated-access callers need to depend on programmatically. This
-# ContextVar is the side channel: record_obo_failure is called at each of
-# this module's three raise sites, right before raising, and app.py's /chat
-# handler checks it after the graph finishes (success or not) to decide
-# whether to override the chat response with a stable structured error.
+# result" delegated-access callers need to depend on programmatically.
+#
+# This can NOT be a second ContextVar the way _current_subject_token is: the
+# actual MCP HTTP call (and so record_obo_failure) runs inside a TaskGroup
+# LangGraph's tool execution spawns internally (that's what "unhandled errors
+# in a TaskGroup" in every logged failure actually is) — asyncio/anyio only
+# copy a ContextVar's value DOWN into a child task at spawn time, never back
+# UP when a child task calls .set(); a value set from inside that child task
+# would simply vanish with it. current_subject_token() only ever reads inside
+# the child task, so that asymmetry never bit it, but recording a failure
+# needs the opposite direction.
+#
+# So the signal is a plain dict, keyed by a fresh id generated per request —
+# plain dict writes ARE visible across task boundaries, since there's only
+# one of it, not a per-task copy. The id itself still travels down via a
+# ContextVar (read-only, the direction that does work), and request_key's own
+# value is what ties a failure recorded in some child task back to the one
+# /chat call it belongs to — this also means two concurrent calls that
+# happen to share a client-supplied session_id (e.g. a double-submitted
+# request) still can't cross-contaminate each other's failure, since each
+# gets its own fresh key regardless of session_id.
 # ---------------------------------------------------------------------------
-_last_obo_failure: ContextVar[BaseException | None] = ContextVar("obo_last_failure", default=None)
+_current_request_key: ContextVar[str | None] = ContextVar("obo_request_key", default=None)
+_obo_failures_by_request: dict[str, BaseException] = {}
 
 
 def extract_bearer_token(authorization_header: str | None) -> str | None:
@@ -286,17 +304,21 @@ def subject_token_scope(token: str | None):
     """Make ``token`` the active caller identity for every OBO exchange made
     inside this block, in this task and any task spawned from inside it.
 
-    Also clears any OBO failure recorded by a previous request sharing this
-    task-local context, so a stale failure can never leak into a request that
-    never touched OBO at all.
+    Yields this request's unique key — callers that want to check
+    ``last_obo_failure`` after the block need it, since the failure itself
+    isn't readable through a ContextVar (see the module-level comment above).
+    Always drops this request's own entry from the failure dict on exit,
+    whether or not it was ever read, so a request nobody checks never leaks.
     """
+    request_key = str(uuid.uuid4())
     reset: Token[str | None] = _current_subject_token.set(token)
-    failure_reset: Token[BaseException | None] = _last_obo_failure.set(None)
+    key_reset: Token[str | None] = _current_request_key.set(request_key)
     try:
-        yield
+        yield request_key
     finally:
         _current_subject_token.reset(reset)
-        _last_obo_failure.reset(failure_reset)
+        _current_request_key.reset(key_reset)
+        _obo_failures_by_request.pop(request_key, None)
 
 
 def current_subject_token() -> str | None:
@@ -304,18 +326,34 @@ def current_subject_token() -> str | None:
 
 
 def record_obo_failure(exc: BaseException) -> None:
-    """Record the most recent OBO-layer failure for this request, for
-    app.py's /chat handler to check after the graph finishes. Called at each
+    """Record the most recent OBO-layer failure for the request currently in
+    subject_token_scope, for app.py's /chat handler to check (via
+    last_obo_failure(request_key)) after the graph finishes. Called at each
     of this module's raise sites, right before raising — never a substitute
     for raising, since ToolNode still needs the real exception to produce its
-    own tool-error message for the model to see and react to in-context."""
-    _last_obo_failure.set(exc)
+    own tool-error message for the model to see and react to in-context.
+
+    A no-op outside any subject_token_scope (current_request_key() is None)
+    — the one-time startup discovery call is the only place that's true, and
+    it never reaches DelegatedTokenAuth's raise sites in the first place (see
+    _OboOrAgentIdentityAuth), so this is just a defensive guard, not a path
+    anything is expected to actually take.
+    """
+    request_key = _current_request_key.get()
+    if request_key is None:
+        logger.warning(
+            "[OBO][WARN] record_obo_failure called with no active request — this failure won't be "
+            "surfaced as a stable result, only as whatever the model narrates: %s", exc,
+        )
+        return
+    _obo_failures_by_request[request_key] = exc
 
 
-def last_obo_failure() -> BaseException | None:
-    """The most recent OBO failure recorded during the current request, if
-    any — see record_obo_failure."""
-    return _last_obo_failure.get()
+def last_obo_failure(request_key: str) -> BaseException | None:
+    """The OBO failure recorded for request_key (the value subject_token_scope
+    yielded for this request), if any — see record_obo_failure. Consumes it:
+    a second call for the same key returns None."""
+    return _obo_failures_by_request.pop(request_key, None)
 
 
 def obo_enabled() -> bool:

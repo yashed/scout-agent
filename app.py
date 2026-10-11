@@ -187,7 +187,7 @@ async def chat(request: ChatRequest, http_request: Request) -> ChatResponse | JS
     wrapped_message = _wrap_user_message(request.message, request.context)
     obo_failure: BaseException | None = None
     try:
-        with subject_token_scope(subject_token):
+        with subject_token_scope(subject_token) as request_key:
             result = await agent_graph.ainvoke(
                 {"messages": [HumanMessage(content=wrapped_message)]},
                 config={
@@ -195,10 +195,14 @@ async def chat(request: ChatRequest, http_request: Request) -> ChatResponse | JS
                     "configurable": {"thread_id": request.session_id},
                 },
             )
-            # Must be read before this `with` block exits: subject_token_scope
-            # clears the OBO-failure signal in its own finally, same as it
-            # clears the subject token, so this is the last point it's visible.
-            obo_failure = last_obo_failure()
+            # Keyed by request_key, not session_id: a client can (and did, in
+            # testing) submit the same session_id twice concurrently, and each
+            # call's own failure must stay its own — see the module-level
+            # comment on obo_identity's request-key dict for why a ContextVar
+            # alone can't carry this value back out of here at all (the actual
+            # MCP call, and so record_obo_failure, runs inside a TaskGroup
+            # LangGraph spawns internally).
+            obo_failure = last_obo_failure(request_key)
     except Exception:
         logger.exception("chat invoke failed: session_id=%s", request.session_id)
         raise HTTPException(

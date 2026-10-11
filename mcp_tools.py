@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import AsyncGenerator, Sequence
 from typing import Any
 
 import httpx
@@ -9,15 +10,57 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from agent_identity import AgentIdentityAuth, agent_identity_configured
 from config import settings
-from obo_identity import DelegatedTokenAuth, obo_enabled
+from obo_identity import DelegatedTokenAuth, current_subject_token, obo_enabled
 
 logger = logging.getLogger(__name__)
 
 # Shared cache mapping: one auth instance per resource (proxy handle). Which
 # class populates this depends on settings.obo_enabled (see _server_configs):
 # AgentIdentityAuth mints this agent's own client_credentials token;
-# DelegatedTokenAuth exchanges the current request's caller token instead.
+# _OboOrAgentIdentityAuth exchanges the current request's caller token instead
+# (falling back to the agent's own identity only for the one-time startup
+# discovery call, which runs before any caller token exists — see its
+# docstring).
 _mcp_auths: dict[str, httpx.Auth] = {}
+
+
+class _OboOrAgentIdentityAuth(httpx.Auth):
+    """The OBO auth used for MCP proxy clients, with one deliberate escape
+    hatch for process startup.
+
+    Scout builds each proxy's ``MultiServerMCPClient`` once at import time
+    (see ``app.py``) and immediately calls ``get_tools()`` on it to learn
+    what tools that proxy exposes, before any ``/chat`` request — and
+    therefore any caller token — exists. ``DelegatedTokenAuth`` has no
+    fallback by design (see its docstring) and raises
+    ``MissingSubjectTokenError`` in that situation, which would otherwise
+    make every OBO-enabled proxy permanently discover zero tools, since
+    nothing ever retries that one-time call later.
+
+    Listing a proxy's available tool schemas isn't a delegated action taken
+    on any particular caller's behalf — it's platform metadata ("what
+    operations does this MCP server expose"), so it's fine for that one call
+    to use the agent's own AgentID identity instead. Every actual tool
+    *invocation* happens inside ``app.py``'s ``subject_token_scope(...)``
+    block, where a caller token is always active, so it is routed to the
+    real ``DelegatedTokenAuth`` flow below unchanged — the "no fallback"
+    guarantee for genuine tool calls still holds.
+    """
+
+    def __init__(self, resource: str, scopes: Sequence[str] = ()) -> None:
+        self._delegated = DelegatedTokenAuth(resource=resource, scopes=scopes)
+        self._agent_identity = AgentIdentityAuth(resource=resource)
+
+    async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
+        auth = self._delegated if current_subject_token() else self._agent_identity
+        flow = auth.async_auth_flow(request)
+        next_request = await flow.asend(None)
+        while True:
+            response = yield next_request
+            try:
+                next_request = await flow.asend(response)
+            except StopAsyncIteration:
+                break
 
 
 def _server_configs() -> dict[str, dict[str, Any]]:
@@ -35,10 +78,11 @@ def _server_configs() -> dict[str, dict[str, Any]]:
     attaches a live `Authorization: Bearer` token to every request, minted
     and refreshed on demand.
 
-    When AMP_OBO_ENABLED is also true, that `auth` is DelegatedTokenAuth
-    instead (see obo_identity.py): each MCP call exchanges the current
-    /chat request's caller token for one scoped to that proxy, rather than
-    using this agent's own client_credentials identity.
+    When AMP_OBO_ENABLED is also true, that `auth` is _OboOrAgentIdentityAuth
+    instead (see its docstring above): each real /chat tool call exchanges
+    the current request's caller token for one scoped to that proxy, rather
+    than using this agent's own client_credentials identity — except the
+    one-time startup discovery call below, which has no caller token yet.
     """
     proxies = {
         "fetch": (settings.fetch_mcp_url, settings.fetch_mcp_api_key, settings.fetch_obo_scopes),
@@ -96,7 +140,7 @@ def _server_configs() -> dict[str, dict[str, Any]]:
         if use_obo:
             if name not in _mcp_auths:
                 scopes = obo_scopes_raw.split() if obo_scopes_raw else ()
-                _mcp_auths[name] = DelegatedTokenAuth(resource=url, scopes=scopes)
+                _mcp_auths[name] = _OboOrAgentIdentityAuth(resource=url, scopes=scopes)
             config["auth"] = _mcp_auths[name]
             logger.info(
                 "  [OK]   '%s' OBO delegated-token auth attached (scopes=%s)",

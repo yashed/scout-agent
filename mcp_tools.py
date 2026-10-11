@@ -59,8 +59,8 @@ class _OboOrAgentIdentityAuth(httpx.Auth):
     ``MissingSubjectTokenError`` instead of silently running as the agent.
     """
 
-    def __init__(self, resource: str, scopes: Sequence[str] = ()) -> None:
-        self._delegated = DelegatedTokenAuth(resource=resource, scopes=scopes)
+    def __init__(self, resource: str, scopes: Sequence[str] = (), *, proxy_handle: str | None = None) -> None:
+        self._delegated = DelegatedTokenAuth(resource=resource, scopes=scopes, proxy_handle=proxy_handle)
         self._agent_identity = AgentIdentityAuth(resource=resource)
 
     async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
@@ -97,8 +97,13 @@ def _server_configs() -> dict[str, dict[str, Any]]:
     one-time startup discovery call below, which has no caller token yet.
     """
     proxies = {
-        "fetch": (settings.fetch_mcp_url, settings.fetch_mcp_api_key, settings.fetch_obo_scopes),
-        "deepwiki": (settings.deepwiki_mcp_url, settings.deepwiki_mcp_api_key, settings.deepwiki_obo_scopes),
+        "fetch": (
+            settings.fetch_mcp_url, settings.fetch_mcp_api_key, settings.fetch_obo_scopes, settings.fetch_proxy_handle,
+        ),
+        "deepwiki": (
+            settings.deepwiki_mcp_url, settings.deepwiki_mcp_api_key, settings.deepwiki_obo_scopes,
+            settings.deepwiki_proxy_handle,
+        ),
     }
 
     logger.info("=" * 70)
@@ -119,7 +124,7 @@ def _server_configs() -> dict[str, dict[str, Any]]:
     )
 
     configs: dict[str, dict[str, Any]] = {}
-    for name, (url, api_key, obo_scopes_raw) in proxies.items():
+    for name, (url, api_key, obo_scopes_raw, proxy_handle) in proxies.items():
         # Log the actual values (including secrets) for debugging
         logger.info(
             "[DEBUG] MCP proxy '%s': url='%s' | api_key='%s'",
@@ -152,11 +157,11 @@ def _server_configs() -> dict[str, dict[str, Any]]:
         if use_obo:
             if name not in _mcp_auths:
                 scopes = obo_scopes_raw.split() if obo_scopes_raw else ()
-                _mcp_auths[name] = _OboOrAgentIdentityAuth(resource=url, scopes=scopes)
+                _mcp_auths[name] = _OboOrAgentIdentityAuth(resource=url, scopes=scopes, proxy_handle=proxy_handle)
             config["auth"] = _mcp_auths[name]
             logger.info(
-                "  [OK]   '%s' OBO delegated-token auth attached (scopes=%s)",
-                name, obo_scopes_raw or "(none requested)",
+                "  [OK]   '%s' OBO delegated-token auth attached (scopes=%s, proxy_handle=%s)",
+                name, obo_scopes_raw or "(none requested)", proxy_handle,
             )
         elif identity_ready:
             if name not in _mcp_auths:

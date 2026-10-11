@@ -58,6 +58,22 @@ class Settings(BaseSettings):
     fetch_obo_scopes: str = Field(default="", validation_alias="FETCH_OBO_SCOPES")
     deepwiki_obo_scopes: str = Field(default="", validation_alias="DEEPWIKI_OBO_SCOPES")
 
+    # Which MCP proxy (by its stable handle, e.g. "fetch") each of this
+    # agent's own Tool Configuration URLs above corresponds to — needed to
+    # match AMP_OBO_DELEGATION_CEILING's proxy-handle-keyed entries (see
+    # obo_identity.py's DelegationCeiling) back to FETCH_URL/DEEPWIKI_URL.
+    # Defaults match this agent's own Tool Configuration names; override if
+    # yours differ from the underlying MCP Server's handle.
+    fetch_proxy_handle: str = Field(default="fetch", validation_alias="FETCH_PROXY_HANDLE")
+    deepwiki_proxy_handle: str = Field(default="deepwiki", validation_alias="DEEPWIKI_PROXY_HANDLE")
+
+    # Admin-set delegation ceiling, injected by Agent Manager as a JSON array
+    # of {"resource": "<proxy handle>", "scopes": [...]} whenever OBO
+    # enablement or the ceiling itself changes. See obo_identity.py's
+    # DelegationCeiling for how this agent enforces it before ever asking
+    # ThunderID for a delegated scope.
+    obo_delegation_ceiling_raw: str = Field(default="", validation_alias="AMP_OBO_DELEGATION_CEILING")
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
@@ -106,6 +122,12 @@ def dump_settings() -> None:
     logger.info("  AMP_OBO_ENABLED            = %s", settings.obo_enabled)
     logger.info("  FETCH_OBO_SCOPES           = %s", settings.fetch_obo_scopes if settings.fetch_obo_scopes else "(unset)")
     logger.info("  DEEPWIKI_OBO_SCOPES        = %s", settings.deepwiki_obo_scopes if settings.deepwiki_obo_scopes else "(unset)")
+    logger.info("  FETCH_PROXY_HANDLE         = %s", settings.fetch_proxy_handle)
+    logger.info("  DEEPWIKI_PROXY_HANDLE      = %s", settings.deepwiki_proxy_handle)
+    logger.info(
+        "  AMP_OBO_DELEGATION_CEILING = %s",
+        settings.obo_delegation_ceiling_raw if settings.obo_delegation_ceiling_raw else "(unset)",
+    )
     logger.info("=" * 70)
 
     # Quick validation checks
@@ -184,6 +206,13 @@ def dump_settings() -> None:
         if not settings.deepwiki_obo_scopes and settings.deepwiki_mcp_url:
             logger.warning(
                 "  [WARN]  DEEPWIKI_OBO_SCOPES is unset — same as above, for DeepWiki"
+            )
+        if not settings.obo_delegation_ceiling_raw:
+            logger.warning(
+                "  [WARN]  AMP_OBO_DELEGATION_CEILING is unset — this agent has no admin-configured "
+                "delegation ceiling injected yet, so every delegated request will be refused client-side "
+                "(see obo_identity.py's DelegationCeiling). Add at least one resource to this AgentID's "
+                "delegation ceiling in the console."
             )
     else:
         logger.info("  [INFO]  AMP_OBO_ENABLED is false — MCP calls use this agent's own client_credentials identity")

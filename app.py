@@ -19,13 +19,22 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field, field_validator
 
 from config import dump_all_env_vars, dump_settings
 from graph import build_graph
 from mcp_tools import load_mcp_tools
-from obo_identity import extract_bearer_token, obo_enabled, subject_token_scope
+from obo_identity import (
+    DelegationDeniedError,
+    MissingSubjectTokenError,
+    TokenExchangeError,
+    extract_bearer_token,
+    last_obo_failure,
+    obo_enabled,
+    subject_token_scope,
+)
 from tools import NATIVE_TOOLS
 
 # ---------------------------------------------------------------------------
@@ -120,8 +129,40 @@ def _wrap_user_message(user_message: str, context: dict[str, Any]) -> str:
     )
 
 
+def _obo_failure_response(failure: BaseException) -> JSONResponse | None:
+    """Translate an OBO-layer failure into the plan's required stable
+    "authorization_required" / "access_denied" result (see the design doc's
+    "Runtime exchange" requirements), instead of letting the caller see only
+    whatever prose the model wrote narrating ToolNode's swallowed exception —
+    see obo_identity.last_obo_failure's doc comment for why that's otherwise
+    the only place this failure would be visible. Returns None for anything
+    that isn't an OBO-layer failure, so the caller falls through to the
+    normal chat response.
+    """
+    if isinstance(failure, MissingSubjectTokenError):
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"error": "authorization_required", "message": str(failure)},
+        )
+    if isinstance(failure, DelegationDeniedError):
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content={"error": "access_denied", "message": str(failure)},
+        )
+    if isinstance(failure, TokenExchangeError):
+        # Not a denial — the exchange itself couldn't complete (timeout,
+        # malformed response, endpoint unreachable). Kept distinct from
+        # access_denied so a caller knows retrying later might help, unlike
+        # a genuine denial.
+        return JSONResponse(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            content={"error": "token_exchange_failed", "message": str(failure)},
+        )
+    return None
+
+
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
+async def chat(request: ChatRequest, http_request: Request) -> ChatResponse | JSONResponse:
     # The caller's own access token, forwarded by Agent Manager's gateway when
     # this agent's "Invocation security is OAuth" + "Token forwarding" are
     # both enabled (see Agent ID -> Delegated Access in the console). Only
@@ -144,6 +185,7 @@ async def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
             "silently running as this agent's own identity"
         )
     wrapped_message = _wrap_user_message(request.message, request.context)
+    obo_failure: BaseException | None = None
     try:
         with subject_token_scope(subject_token):
             result = await agent_graph.ainvoke(
@@ -153,12 +195,26 @@ async def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
                     "configurable": {"thread_id": request.session_id},
                 },
             )
+            # Must be read before this `with` block exits: subject_token_scope
+            # clears the OBO-failure signal in its own finally, same as it
+            # clears the subject token, so this is the last point it's visible.
+            obo_failure = last_obo_failure()
     except Exception:
         logger.exception("chat invoke failed: session_id=%s", request.session_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error",
         )
+
+    if obo_failure is not None:
+        failure_response = _obo_failure_response(obo_failure)
+        if failure_response is not None:
+            logger.warning(
+                "[OBO][WARN] /chat session_id='%s' — overriding chat response with a stable OBO failure "
+                "result instead of the model's narrated tool-error text: %s: %s",
+                request.session_id, type(obo_failure).__name__, obo_failure,
+            )
+            return failure_response
 
     messages = result.get("messages") if isinstance(result, dict) else None
     if not messages:

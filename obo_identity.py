@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import time
 from collections.abc import AsyncGenerator, Sequence
@@ -167,6 +168,69 @@ class DelegationDeniedError(TokenExchangeError):
     """The exchange was well-formed but denied: no trust/mapping/scope path."""
 
 
+@dataclass(frozen=True)
+class DelegationCeiling:
+    """This agent's admin-set delegation ceiling: the MCP resources/scopes it
+    may request on a caller's behalf, keyed by MCP proxy handle (e.g.
+    ``"fetch"``) — injected by Agent Manager as ``AMP_OBO_DELEGATION_CEILING``
+    whenever OBO enablement or the ceiling itself changes.
+
+    ThunderID enforces no equivalent limit of its own: its token-exchange
+    grant handler resolves permissions purely from the caller's mapped role,
+    with no concept of which AgentID authenticated the exchange (confirmed
+    against ThunderID's own integration test suite — a mapping's target role,
+    with zero agent/user assignment of its own, is still reachable by any
+    caller whose claims match it). Without this check, a role that happens to
+    grant more than an agent should request would do so silently. ``check``
+    is the enforcement point: called before every delegated exchange attempt,
+    so a misconfigured ``<PROXY>_OBO_SCOPES`` value can never reach ThunderID
+    at all — refuse, don't narrow, matching ``MissingSubjectTokenError``'s own
+    no-fallback posture.
+    """
+
+    _by_handle: dict[str, frozenset[str]]
+
+    @classmethod
+    def from_env(cls, raw: str) -> DelegationCeiling:
+        if not raw:
+            return cls(_by_handle={})
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            logger.error(
+                "[OBO][FAIL] AMP_OBO_DELEGATION_CEILING is not valid JSON — treating it as empty, "
+                "so every delegated request will be refused client-side until this is fixed: %r",
+                raw[:200],
+            )
+            return cls(_by_handle={})
+
+        by_handle: dict[str, frozenset[str]] = {}
+        for entry in parsed if isinstance(parsed, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            resource = entry.get("resource")
+            scopes = entry.get("scopes")
+            if isinstance(resource, str) and isinstance(scopes, list):
+                by_handle[resource] = frozenset(s for s in scopes if isinstance(s, str))
+        return cls(_by_handle=by_handle)
+
+    def check(self, proxy_handle: str, requested_scopes: Sequence[str]) -> None:
+        """Raise DelegationDeniedError if proxy_handle isn't on this agent's
+        injected ceiling, or if any requested_scopes for it aren't."""
+        allowed = self._by_handle.get(proxy_handle)
+        if allowed is None:
+            raise DelegationDeniedError(
+                f"resource {proxy_handle!r} is not on this agent's delegation ceiling "
+                "(AMP_OBO_DELEGATION_CEILING) — add it to this AgentID in the console before requesting it"
+            )
+        disallowed = [s for s in requested_scopes if s not in allowed]
+        if disallowed:
+            raise DelegationDeniedError(
+                f"scopes {disallowed} for resource {proxy_handle!r} are not on this agent's delegation "
+                f"ceiling (allowed: {sorted(allowed)})"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Per-request subject token context
 #
@@ -181,6 +245,23 @@ class DelegationDeniedError(TokenExchangeError):
 # internal async scheduling.
 # ---------------------------------------------------------------------------
 _current_subject_token: ContextVar[str | None] = ContextVar("obo_subject_token", default=None)
+
+# ---------------------------------------------------------------------------
+# Per-request OBO failure signal
+#
+# LangGraph's ToolNode catches every exception a tool raises (including
+# MissingSubjectTokenError / DelegationDeniedError / TokenExchangeError) and
+# turns it into a ToolMessage the model then narrates in prose — useful for
+# ordinary tool failures ("that URL doesn't exist"), but it means a genuine
+# authorization failure would otherwise reach the caller as free-form text in
+# a 200 OK response, not the "stable authorization_required or access_denied
+# result" delegated-access callers need to depend on programmatically. This
+# ContextVar is the side channel: record_obo_failure is called at each of
+# this module's three raise sites, right before raising, and app.py's /chat
+# handler checks it after the graph finishes (success or not) to decide
+# whether to override the chat response with a stable structured error.
+# ---------------------------------------------------------------------------
+_last_obo_failure: ContextVar[BaseException | None] = ContextVar("obo_last_failure", default=None)
 
 
 def extract_bearer_token(authorization_header: str | None) -> str | None:
@@ -203,16 +284,38 @@ def extract_bearer_token(authorization_header: str | None) -> str | None:
 @contextmanager
 def subject_token_scope(token: str | None):
     """Make ``token`` the active caller identity for every OBO exchange made
-    inside this block, in this task and any task spawned from inside it."""
+    inside this block, in this task and any task spawned from inside it.
+
+    Also clears any OBO failure recorded by a previous request sharing this
+    task-local context, so a stale failure can never leak into a request that
+    never touched OBO at all.
+    """
     reset: Token[str | None] = _current_subject_token.set(token)
+    failure_reset: Token[BaseException | None] = _last_obo_failure.set(None)
     try:
         yield
     finally:
         _current_subject_token.reset(reset)
+        _last_obo_failure.reset(failure_reset)
 
 
 def current_subject_token() -> str | None:
     return _current_subject_token.get()
+
+
+def record_obo_failure(exc: BaseException) -> None:
+    """Record the most recent OBO-layer failure for this request, for
+    app.py's /chat handler to check after the graph finishes. Called at each
+    of this module's raise sites, right before raising — never a substitute
+    for raising, since ToolNode still needs the real exception to produce its
+    own tool-error message for the model to see and react to in-context."""
+    _last_obo_failure.set(exc)
+
+
+def last_obo_failure() -> BaseException | None:
+    """The most recent OBO failure recorded during the current request, if
+    any — see record_obo_failure."""
+    return _last_obo_failure.get()
 
 
 def obo_enabled() -> bool:
@@ -228,6 +331,17 @@ def obo_enabled() -> bool:
     return settings.obo_enabled and agent_identity_configured()
 
 
+_delegation_ceiling = DelegationCeiling.from_env(settings.obo_delegation_ceiling_raw)
+
+
+def delegation_ceiling() -> DelegationCeiling:
+    """This agent's injected delegation ceiling, parsed once at process
+    startup like every other setting — Agent Manager rolls the pod with a
+    fresh value whenever the ceiling changes, the same way it already does
+    for AMP_AGENTID_SCOPES."""
+    return _delegation_ceiling
+
+
 class DelegatedTokenAuth(httpx.Auth):
     """Attaches a delegated (OBO) bearer token to every MCP request for one
     resource, exchanging the current request's caller token for one scoped
@@ -239,12 +353,21 @@ class DelegatedTokenAuth(httpx.Auth):
 
     There is deliberately no fallback to the agent's own identity: a tool
     call made without an active caller token raises MissingSubjectTokenError
-    rather than silently running as the agent instead of the user.
+    rather than silently running as the agent instead of the user. Nor is
+    there a fallback past the injected delegation ceiling (see
+    DelegationCeiling): a request for a resource/scope outside it raises
+    DelegationDeniedError before ever reaching ThunderID.
     """
 
-    def __init__(self, resource: str, scopes: Sequence[str] = ()) -> None:
+    def __init__(self, resource: str, scopes: Sequence[str] = (), *, proxy_handle: str | None = None) -> None:
         self._resource = resource
         self._scopes = tuple(scopes)
+        # The ceiling is keyed by MCP proxy handle (e.g. "fetch"), not by this
+        # resource's resolved URL — see DelegationCeiling's docstring. Falls
+        # back to the resource URL itself only if no handle was given, which
+        # will simply never match any ceiling entry and so always deny; every
+        # real construction site (mcp_tools.py) always passes one.
+        self._proxy_handle = proxy_handle or resource
         # Cache keyed by (hash of caller token, resource, scopes): the same
         # caller re-invoking the same tool within the token's lifetime reuses
         # the exchanged token instead of re-exchanging on every call. The
@@ -264,6 +387,11 @@ class DelegatedTokenAuth(httpx.Auth):
 
         if response.status_code not in (401, 403):
             return
+
+        # The server just told us this exact token is no good (401) or lacks a
+        # scope (403) — either way, serving it again from cache next call
+        # would just repeat the same failure until it naturally expires.
+        await self._evict_cached_token(token)
 
         challenge = _parse_www_authenticate(response.headers.get("WWW-Authenticate", ""))
         if challenge.error not in _CHALLENGE_ERROR_CODES or not challenge.resource_metadata:
@@ -333,6 +461,17 @@ class DelegatedTokenAuth(httpx.Auth):
         return advertised_resource, retry_scopes
 
     async def _get_delegated_token(self, resource: str, scopes: Sequence[str]) -> str:
+        try:
+            delegation_ceiling().check(self._proxy_handle, scopes)
+        except DelegationDeniedError as exc:
+            logger.error(
+                "[OBO][FAIL] %s — refusing to request it rather than relying on ThunderID to also "
+                "enforce this (it does not; see DelegationCeiling's docstring)",
+                exc,
+            )
+            record_obo_failure(exc)
+            raise
+
         subject_token = current_subject_token()
         if not subject_token:
             logger.error(
@@ -341,9 +480,11 @@ class DelegatedTokenAuth(httpx.Auth):
                 "Delegated Access -> 'Token forwarding is enabled')",
                 resource,
             )
-            raise MissingSubjectTokenError(
+            exc = MissingSubjectTokenError(
                 f"OBO exchange for resource {resource!r} attempted with no caller token in scope"
             )
+            record_obo_failure(exc)
+            raise exc
 
         cache_key = self._cache_key(subject_token, resource, scopes)
 
@@ -369,6 +510,17 @@ class DelegatedTokenAuth(httpx.Auth):
         digest = hashlib.sha256(subject_token.encode("utf-8")).hexdigest()
         return f"{digest}|{resource}|{','.join(sorted(scopes))}"
 
+    async def _evict_cached_token(self, token: str) -> None:
+        """Remove token from the cache, however it got there — a 401/403
+        response is authoritative over the cache's own TTL. Matches by value
+        rather than recomputing the cache key, since the exact (subject,
+        scopes) pairing that produced token isn't available at the call site
+        (self._scopes may differ from what a prior challenge retry requested)."""
+        async with self._lock:
+            stale_keys = [key for key, (cached_token, _) in self._cache.items() if cached_token == token]
+            for key in stale_keys:
+                del self._cache[key]
+
     async def _exchange(self, subject_token: str, resource: str, scopes: Sequence[str]) -> tuple[str, float]:
         form: dict[str, str] = {
             "grant_type": TOKEN_EXCHANGE_GRANT_TYPE,
@@ -388,23 +540,33 @@ class DelegatedTokenAuth(httpx.Auth):
                 )
         except httpx.TimeoutException as exc:
             logger.error("[OBO][FAIL] token endpoint timed out for resource='%s'", resource)
-            raise TokenExchangeError(f"Token endpoint timed out: {exc}") from exc
+            timeout_exc = TokenExchangeError(f"Token endpoint timed out: {exc}")
+            record_obo_failure(timeout_exc)
+            raise timeout_exc from exc
         except httpx.HTTPError as exc:
             logger.error("[OBO][FAIL] token endpoint request failed for resource='%s': %s", resource, exc)
-            raise TokenExchangeError(f"Token endpoint request failed: {exc}") from exc
+            request_exc = TokenExchangeError(f"Token endpoint request failed: {exc}")
+            record_obo_failure(request_exc)
+            raise request_exc from exc
 
         if response.status_code != 200:
-            raise self._error_for_response(response, resource)
+            denial = self._error_for_response(response, resource)
+            record_obo_failure(denial)
+            raise denial
 
         try:
             payload = response.json()
         except ValueError as exc:
-            raise TokenExchangeError("Token endpoint response was not valid JSON") from exc
+            bad_json_exc = TokenExchangeError("Token endpoint response was not valid JSON")
+            record_obo_failure(bad_json_exc)
+            raise bad_json_exc from exc
 
         access_token = payload.get("access_token")
         expires_in = payload.get("expires_in")
         if not access_token or not isinstance(expires_in, (int, float)):
-            raise TokenExchangeError("Token endpoint response is missing access_token/expires_in")
+            malformed_exc = TokenExchangeError("Token endpoint response is missing access_token/expires_in")
+            record_obo_failure(malformed_exc)
+            raise malformed_exc
 
         # Refresh at 75% of the token's lifetime, matching agent_identity.py's
         # existing client_credentials cache so both auth paths behave the same way.

@@ -41,8 +41,6 @@ st.set_page_config(page_title="OBO Flow Tester", layout="wide")
 _DEFAULTS = {
     "log": [],
     "caller_token": None,
-    "pkce_verifier": None,
-    "oauth_state": None,
     "chat_response": None,
     "session_id": str(uuid.uuid4()),
 }
@@ -97,6 +95,29 @@ def make_pkce_pair() -> tuple[str, str]:
     return verifier, challenge
 
 
+def encode_state(data: dict) -> str:
+    """Pack everything the callback will need into the OAuth `state` value
+    itself, rather than st.session_state.
+
+    Streamlit starts a brand-new session on every full browser navigation —
+    including the external redirect to the IdP and back, even in the same
+    tab — so anything stashed in session_state before the redirect (the PKCE
+    verifier, the sidebar's issuer/client_id/redirect_uri) is already gone by
+    the time the callback arrives. `state` is the one piece of this request
+    the IdP is contractually required to echo back unchanged, so it's the
+    only reliable place to carry state across the round-trip here.
+    """
+    raw = json.dumps(data).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def decode_state(value: str) -> dict:
+    def pad(s: str) -> str:
+        return s + "=" * (-len(s) % 4)
+
+    return json.loads(base64.urlsafe_b64decode(pad(value)))
+
+
 # ---------------------------------------------------------------------------
 # Sidebar — configuration (nothing here is persisted to disk)
 # ---------------------------------------------------------------------------
@@ -130,24 +151,30 @@ if st.sidebar.button("Reset everything"):
     st.rerun()
 
 # ---------------------------------------------------------------------------
-# Catch the OAuth redirect back from Okta, if this load carries one
+# Catch the OAuth redirect back from Okta, if this load carries one.
+#
+# This is necessarily a fresh Streamlit session (see encode_state's
+# docstring), so nothing here can read st.session_state from before the
+# redirect — everything needed is decoded from `state` itself instead.
 # ---------------------------------------------------------------------------
 params = st.query_params
 if "code" in params and st.session_state["caller_token"] is None:
     code = params["code"]
-    returned_state = params.get("state")
-    if returned_state != st.session_state["oauth_state"]:
-        log("FAIL", f"state mismatch on callback: expected {st.session_state['oauth_state']!r}, got {returned_state!r}")
-    elif not st.session_state["pkce_verifier"]:
-        log("FAIL", "no code_verifier in session — did sign-in happen in a different tab/session?")
-    else:
-        token_url = f"{okta_issuer}/v1/token"
+    raw_state = params.get("state", "")
+    try:
+        state_payload = decode_state(raw_state)
+    except Exception as exc:
+        log("FAIL", f"could not decode state parameter ({exc}) — the callback URL may be stale or malformed")
+        state_payload = None
+
+    if state_payload:
+        token_url = f"{state_payload['issuer']}/v1/token"
         form = {
             "grant_type": "authorization_code",
-            "client_id": okta_client_id,
-            "redirect_uri": okta_redirect_uri,
+            "client_id": state_payload["client_id"],
+            "redirect_uri": state_payload["redirect_uri"],
             "code": code,
-            "code_verifier": st.session_state["pkce_verifier"],
+            "code_verifier": state_payload["verifier"],
         }
         log("INFO", "Authorization code received — exchanging it for a caller access token")
         log_request("POST", token_url, {"content-type": "application/x-www-form-urlencoded"}, form)
@@ -198,9 +225,13 @@ with col_main:
     else:
         if st.button("Sign in with Okta", type="primary"):
             verifier, challenge = make_pkce_pair()
-            state = secrets.token_urlsafe(16)
-            st.session_state["pkce_verifier"] = verifier
-            st.session_state["oauth_state"] = state
+            state = encode_state({
+                "verifier": verifier,
+                "nonce": secrets.token_urlsafe(8),
+                "issuer": okta_issuer,
+                "client_id": okta_client_id,
+                "redirect_uri": okta_redirect_uri,
+            })
             query = {
                 "client_id": okta_client_id,
                 "response_type": "code",

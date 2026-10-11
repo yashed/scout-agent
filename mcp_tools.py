@@ -10,7 +10,7 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from agent_identity import AgentIdentityAuth, agent_identity_configured
 from config import settings
-from obo_identity import DelegatedTokenAuth, current_subject_token, obo_enabled
+from obo_identity import DelegatedTokenAuth, obo_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,16 @@ logger = logging.getLogger(__name__)
 # discovery call, which runs before any caller token exists — see its
 # docstring).
 _mcp_auths: dict[str, httpx.Auth] = {}
+
+# True only for the duration of load_mcp_tools()'s one-time startup call,
+# which runs before the FastAPI app serves any request at all — so there is
+# no concurrent /chat request to race with while this is set. This must be an
+# explicit flag, not inferred from current_subject_token() being empty: a
+# real /chat request whose caller simply sent no Bearer token *also* has an
+# empty subject token, and that case must still raise MissingSubjectTokenError
+# rather than silently falling back to the agent's own identity (see
+# _OboOrAgentIdentityAuth).
+_startup_discovery_active = False
 
 
 class _OboOrAgentIdentityAuth(httpx.Auth):
@@ -40,11 +50,13 @@ class _OboOrAgentIdentityAuth(httpx.Auth):
     Listing a proxy's available tool schemas isn't a delegated action taken
     on any particular caller's behalf — it's platform metadata ("what
     operations does this MCP server expose"), so it's fine for that one call
-    to use the agent's own AgentID identity instead. Every actual tool
-    *invocation* happens inside ``app.py``'s ``subject_token_scope(...)``
-    block, where a caller token is always active, so it is routed to the
-    real ``DelegatedTokenAuth`` flow below unchanged — the "no fallback"
-    guarantee for genuine tool calls still holds.
+    to use the agent's own AgentID identity instead. The routing below keys
+    strictly off ``_startup_discovery_active``, not off whether a caller
+    token happens to be present: every actual tool *invocation* happens
+    inside ``app.py``'s ``subject_token_scope(...)`` block with that flag
+    false, so it always goes through the real ``DelegatedTokenAuth`` flow,
+    even when that particular caller sent no token — which correctly raises
+    ``MissingSubjectTokenError`` instead of silently running as the agent.
     """
 
     def __init__(self, resource: str, scopes: Sequence[str] = ()) -> None:
@@ -52,7 +64,7 @@ class _OboOrAgentIdentityAuth(httpx.Auth):
         self._agent_identity = AgentIdentityAuth(resource=resource)
 
     async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
-        auth = self._delegated if current_subject_token() else self._agent_identity
+        auth = self._agent_identity if _startup_discovery_active else self._delegated
         flow = auth.async_auth_flow(request)
         next_request = await flow.asend(None)
         while True:
@@ -167,7 +179,21 @@ async def load_mcp_tools() -> list:
     others. Returns whatever tools loaded successfully — an empty list if
     none are configured or all fail — so the agent always starts, at worst
     with native tools only.
+
+    Runs with _startup_discovery_active set for its whole duration (see that
+    flag's docstring on _OboOrAgentIdentityAuth) — this function is only ever
+    called once, before the app serves any request, so there is nothing else
+    running concurrently for the flag to leak into.
     """
+    global _startup_discovery_active
+    _startup_discovery_active = True
+    try:
+        return await _load_mcp_tools_impl()
+    finally:
+        _startup_discovery_active = False
+
+
+async def _load_mcp_tools_impl() -> list:
     configs = _server_configs()
     if not configs:
         logger.warning(

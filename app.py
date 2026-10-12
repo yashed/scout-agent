@@ -161,8 +161,35 @@ def _obo_failure_response(failure: BaseException) -> JSONResponse | None:
     return None
 
 
+def _log_inbound_headers(http_request: Request) -> None:
+    """Dumps every header this request actually arrived with — diagnostic for
+    the "is the gateway really stripping Authorization, or forwarding it
+    under a name/casing this agent isn't looking for" question. Starlette's
+    Headers are already lower-cased and merged internally, so this is exactly
+    what extract_bearer_token() itself sees, not a separate/earlier view of
+    the request. Authorization's own VALUE is never logged in full, only its
+    length and a short prefix — enough to confirm whether a real-looking
+    token is attached, without printing a live caller credential, matching
+    this module's existing "presence only" convention for the parsed token.
+    Every OTHER header is logged in full: none of them are expected to carry
+    caller-sensitive data, and seeing exactly what the gateway attaches
+    (x-envoy-*, x-forwarded-*, etc.) is the whole point of this dump.
+    """
+    logger.info("=" * 70)
+    logger.info("[DEBUG] /chat INBOUND REQUEST HEADERS (raw, as received by this pod)")
+    logger.info("=" * 70)
+    for key, value in http_request.headers.items():
+        if key.lower() == "authorization":
+            logger.info("  %s: (len=%d, starts_with=%r)", key, len(value), value[:16])
+        else:
+            logger.info("  %s: %s", key, value)
+    logger.info("=" * 70)
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest, http_request: Request) -> ChatResponse | JSONResponse:
+    _log_inbound_headers(http_request)
+
     # The caller's own access token, forwarded by Agent Manager's gateway when
     # this agent's "Invocation security is OAuth" + "Token forwarding" are
     # both enabled (see Agent ID -> Delegated Access in the console). Only

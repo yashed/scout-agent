@@ -177,6 +177,29 @@ def _parse_www_authenticate(header_value: str) -> _Challenge:
     )
 
 
+# Hosts where plain HTTP is trusted for fetching RFC 9728 protected-resource
+# metadata, mirroring this platform's own established HTTPS-with-an-explicit-
+# local-exception policy (see the OBO plan doc's "Require HTTPS ... Local
+# HTTP exceptions must be explicit development configuration") rather than
+# inventing a separate rule for this one check. ".localhost" is the RFC 6761
+# reserved special-use TLD this entire local deployment already resolves to
+# loopback everywhere (*.amp.localhost, *.gateway.localhost, etc.) — the same
+# reasoning OAuth's own loopback exception for native apps (RFC 8252) relies
+# on: traffic to these hosts never leaves the local machine, so HTTPS buys no
+# protection a network attacker could otherwise defeat.
+_LOOPBACK_METADATA_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _is_trusted_metadata_scheme(metadata_url: str) -> bool:
+    parsed = urlsplit(metadata_url)
+    if parsed.scheme == "https":
+        return True
+    if parsed.scheme != "http":
+        return False
+    hostname = (parsed.hostname or "").lower()
+    return hostname in _LOOPBACK_METADATA_HOSTS or hostname.endswith(".localhost")
+
+
 class MissingSubjectTokenError(Exception):
     """Raised when an OBO exchange is attempted with no caller token in scope.
 
@@ -445,7 +468,8 @@ class DelegatedTokenAuth(httpx.Auth):
         """Validate the challenge's RFC 9728 metadata and return the
         (resource, scopes) to exchange for.
 
-        Refuses the metadata unless it is HTTPS, valid JSON, and advertises
+        Refuses the metadata unless it is HTTPS (or plain HTTP to a loopback
+        host — see _is_trusted_metadata_scheme), valid JSON, and advertises
         exactly the resource this instance already targets — a resource
         server cannot use its own challenge to redirect this agent into
         minting a token for some other resource.
@@ -457,7 +481,7 @@ class DelegatedTokenAuth(httpx.Auth):
         resulting exchange request will ask ThunderID for none.
         """
         metadata_url = challenge.resource_metadata or ""
-        if urlsplit(metadata_url).scheme != "https":
+        if not _is_trusted_metadata_scheme(metadata_url):
             raise UntrustedMetadataError(f"Refusing a non-HTTPS resource_metadata URL: {metadata_url!r}")
 
         async with httpx.AsyncClient(timeout=10) as client:

@@ -167,35 +167,56 @@ def _log_inbound_headers(http_request: Request) -> None:
     under a name/casing this agent isn't looking for" question. Starlette's
     Headers are already lower-cased and merged internally, so this is exactly
     what extract_bearer_token() itself sees, not a separate/earlier view of
-    the request. Authorization's own VALUE is never logged in full, only its
-    length and a short prefix — enough to confirm whether a real-looking
-    token is attached, without printing a live caller credential, matching
-    this module's existing "presence only" convention for the parsed token.
-    Every OTHER header is logged in full: none of them are expected to carry
-    caller-sensitive data, and seeing exactly what the gateway attaches
-    (x-envoy-*, x-forwarded-*, etc.) is the whole point of this dump.
+    the request. Any header whose name contains "authorization" (covers both
+    Authorization and X-Forwarded-Authorization — see
+    _extract_caller_bearer_token's docstring for why both exist) has its
+    VALUE redacted to length + a short prefix, never logged in full, matching
+    this module's existing "presence only" convention for a live caller
+    credential. Every OTHER header is logged in full: none of them are
+    expected to carry caller-sensitive data, and seeing exactly what the
+    gateway attaches (x-envoy-*, x-forwarded-*, etc.) is the whole point of
+    this dump.
     """
     logger.info("=" * 70)
     logger.info("[DEBUG] /chat INBOUND REQUEST HEADERS (raw, as received by this pod)")
     logger.info("=" * 70)
     for key, value in http_request.headers.items():
-        if key.lower() == "authorization":
+        if "authorization" in key.lower():
             logger.info("  %s: (len=%d, starts_with=%r)", key, len(value), value[:16])
         else:
             logger.info("  %s: %s", key, value)
     logger.info("=" * 70)
 
 
+def _extract_caller_bearer_token(http_request: Request) -> str | None:
+    """The caller's own access token, forwarded by Agent Manager's gateway
+    when this agent's "Invocation security is OAuth" + "Token forwarding" are
+    both enabled (see Agent ID -> Delegated Access in the console).
+
+    Found via _log_inbound_headers's diagnostic dump: this gateway's
+    forwardToken=true does not re-attach the caller's token under
+    "Authorization" at all — the gateway consumes that header for its own
+    auth decision and the upstream request carries it under
+    "X-Forwarded-Authorization" instead. This was never issuer-specific: it
+    was confirmed identically for both an Okta-issued and a ThunderKeyManager
+    -issued token, on the same route. "Authorization" is still checked first
+    for local/direct testing (running this agent with no gateway in front,
+    where a caller would naturally send a plain Authorization header), with
+    the gateway's actual header as the fallback that matters in the deployed
+    platform case. Only presence is ever logged, never the token itself —
+    unlike this agent's own static AMP_AGENTID_* secret, this is a live
+    caller credential.
+    """
+    return extract_bearer_token(http_request.headers.get("authorization")) or extract_bearer_token(
+        http_request.headers.get("x-forwarded-authorization")
+    )
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest, http_request: Request) -> ChatResponse | JSONResponse:
     _log_inbound_headers(http_request)
 
-    # The caller's own access token, forwarded by Agent Manager's gateway when
-    # this agent's "Invocation security is OAuth" + "Token forwarding" are
-    # both enabled (see Agent ID -> Delegated Access in the console). Only
-    # its presence is logged, never the token itself — unlike this agent's
-    # own static AMP_AGENTID_* secret, this is a live caller credential.
-    subject_token = extract_bearer_token(http_request.headers.get("authorization"))
+    subject_token = _extract_caller_bearer_token(http_request)
     logger.info(
         "[DEBUG] /chat called — session_id='%s' | message_len=%d | context_keys=%s | "
         "caller_token=%s | obo_enabled=%s",

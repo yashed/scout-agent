@@ -95,6 +95,26 @@ def make_pkce_pair() -> tuple[str, str]:
     return verifier, challenge
 
 
+def discover_oidc_endpoints(issuer: str) -> tuple[str, str]:
+    """Fetches {issuer}/.well-known/openid-configuration and returns its
+    (authorization_endpoint, token_endpoint).
+
+    This used to be `f"{issuer}/v1/authorize"` / `f"{issuer}/v1/token"`,
+    hardcoded — which happens to match Okta's own path convention
+    (.../oauth2/default/v1/authorize) but isn't part of the OIDC spec at
+    all. Auth0's real endpoints are just {issuer}/authorize and
+    {issuer}/oauth/token, no "v1" segment, so that hardcoding silently
+    produced a 404 for any non-Okta issuer. Real discovery is the only way
+    this tool is actually provider-agnostic, which is the whole point of
+    letting the sidebar's issuer field be freeform.
+    """
+    discovery_url = f"{issuer.rstrip('/')}/.well-known/openid-configuration"
+    resp = requests.get(discovery_url, timeout=10)
+    resp.raise_for_status()
+    doc = resp.json()
+    return doc["authorization_endpoint"], doc["token_endpoint"]
+
+
 def encode_state(data: dict) -> str:
     """Pack everything the callback will need into the OAuth `state` value
     itself, rather than st.session_state.
@@ -124,9 +144,10 @@ def decode_state(value: str) -> dict:
 st.sidebar.header("Configuration")
 st.sidebar.caption("Local testing tool. Nothing entered here is written to disk.")
 
-st.sidebar.subheader("1. External IdP (Okta)")
+st.sidebar.subheader("1. External IdP")
+st.sidebar.caption("Any OIDC-compliant provider — endpoints are discovered from the issuer's own .well-known document.")
 okta_issuer = st.sidebar.text_input(
-    "Issuer", placeholder="https://your-domain.okta.com/oauth2/default", key="okta_issuer"
+    "Issuer", placeholder="https://your-domain.okta.com/oauth2/default or https://your-tenant.us.auth0.com/", key="okta_issuer"
 )
 okta_client_id = st.sidebar.text_input("Client ID", key="okta_client_id")
 okta_redirect_uri = st.sidebar.text_input(
@@ -168,7 +189,7 @@ if "code" in params and st.session_state["caller_token"] is None:
         state_payload = None
 
     if state_payload:
-        token_url = f"{state_payload['issuer']}/v1/token"
+        token_url = state_payload["token_endpoint"]
         form = {
             "grant_type": "authorization_code",
             "client_id": state_payload["client_id"],
@@ -221,35 +242,48 @@ with col_main:
     if st.session_state["caller_token"]:
         st.success("Caller token acquired.")
     elif missing_okta:
-        st.info("Fill in the Okta issuer, client ID and redirect URI in the sidebar first.")
+        st.info("Fill in the external IdP's issuer, client ID and redirect URI in the sidebar first.")
     else:
-        if st.button("Sign in with Okta", type="primary"):
-            verifier, challenge = make_pkce_pair()
-            state = encode_state({
-                "verifier": verifier,
-                "nonce": secrets.token_urlsafe(8),
-                "issuer": okta_issuer,
-                "client_id": okta_client_id,
-                "redirect_uri": okta_redirect_uri,
-            })
-            query = {
-                "client_id": okta_client_id,
-                "response_type": "code",
-                "scope": okta_scope,
-                "redirect_uri": okta_redirect_uri,
-                "state": state,
-                "code_challenge_method": "S256",
-                "code_challenge": challenge,
-            }
-            if okta_audience:
-                query["audience"] = okta_audience
-            authorize_url = f"{okta_issuer}/v1/authorize?{urlencode(query)}"
-            log("INFO", f"Redirecting to Okta: {authorize_url}")
-            st.markdown(
-                f'<meta http-equiv="refresh" content="0; url={authorize_url}">',
-                unsafe_allow_html=True,
-            )
-            st.write(f"Redirecting... if nothing happens, [click here]({authorize_url}).")
+        if st.button("Sign in", type="primary"):
+            try:
+                authorization_endpoint, token_endpoint = discover_oidc_endpoints(okta_issuer)
+            except Exception as exc:
+                log("FAIL", f"OIDC discovery failed for issuer {okta_issuer!r}: {exc}")
+                st.error(
+                    f"Couldn't fetch {okta_issuer.rstrip('/')}/.well-known/openid-configuration ({exc}). "
+                    "Check the issuer URL — it should be the base issuer, not an endpoint path."
+                )
+                authorization_endpoint = token_endpoint = None
+
+            if authorization_endpoint and token_endpoint:
+                verifier, challenge = make_pkce_pair()
+                state = encode_state({
+                    "verifier": verifier,
+                    "nonce": secrets.token_urlsafe(8),
+                    "issuer": okta_issuer,
+                    "client_id": okta_client_id,
+                    "redirect_uri": okta_redirect_uri,
+                    "token_endpoint": token_endpoint,
+                })
+                query = {
+                    "client_id": okta_client_id,
+                    "response_type": "code",
+                    "scope": okta_scope,
+                    "redirect_uri": okta_redirect_uri,
+                    "state": state,
+                    "code_challenge_method": "S256",
+                    "code_challenge": challenge,
+                }
+                if okta_audience:
+                    query["audience"] = okta_audience
+                authorize_url = f"{authorization_endpoint}?{urlencode(query)}"
+                log("INFO", f"Discovered endpoints — authorize: {authorization_endpoint} | token: {token_endpoint}")
+                log("INFO", f"Redirecting to IdP: {authorize_url}")
+                st.markdown(
+                    f'<meta http-equiv="refresh" content="0; url={authorize_url}">',
+                    unsafe_allow_html=True,
+                )
+                st.write(f"Redirecting... if nothing happens, [click here]({authorize_url}).")
 
     st.divider()
     st.header("2. Decoded caller token")

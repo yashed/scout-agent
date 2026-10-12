@@ -53,12 +53,19 @@ class AgentIdentityAuth(httpx.Auth):
         self._lock = asyncio.Lock()
 
     async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
-        token = await self._get_token()
+        token = await self.get_token()
         logger.info("[DEBUG] AgentIdentityAuth: attaching Bearer token to request -> %s %s", request.method, request.url)
         request.headers["Authorization"] = f"Bearer {token}"
         yield request
 
-    async def _get_token(self) -> str:
+    async def get_token(self) -> str:
+        """Mint or return this agent's own cached client_credentials token.
+
+        Public (not just used internally by async_auth_flow) because
+        obo_identity.DelegatedTokenAuth composes an AgentIdentityAuth to
+        attempt a call with this agent's own identity before ever
+        considering delegation — see its module docstring.
+        """
         # The lock both protects the cache and coalesces concurrent refreshes
         # onto a single token-endpoint call: whichever request loses the race
         # blocks here, then finds a fresh cached token already waiting.

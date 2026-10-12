@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncGenerator, Sequence
 from typing import Any
 
 import httpx
@@ -17,62 +16,14 @@ logger = logging.getLogger(__name__)
 # Shared cache mapping: one auth instance per resource (proxy handle). Which
 # class populates this depends on settings.obo_enabled (see _server_configs):
 # AgentIdentityAuth mints this agent's own client_credentials token;
-# _OboOrAgentIdentityAuth exchanges the current request's caller token instead
-# (falling back to the agent's own identity only for the one-time startup
-# discovery call, which runs before any caller token exists — see its
-# docstring).
+# DelegatedTokenAuth attempts that same own-identity token first and only
+# exchanges the current request's caller token if the gateway actually
+# challenges for delegation (see obo_identity.py's module docstring) — which
+# also means it needs no special handling for the one-time startup tool
+# discovery call below: if listing a proxy's tools doesn't require
+# delegation, the own-identity attempt just succeeds, same as a real call to
+# an operation that doesn't need it.
 _mcp_auths: dict[str, httpx.Auth] = {}
-
-# True only for the duration of load_mcp_tools()'s one-time startup call,
-# which runs before the FastAPI app serves any request at all — so there is
-# no concurrent /chat request to race with while this is set. This must be an
-# explicit flag, not inferred from current_subject_token() being empty: a
-# real /chat request whose caller simply sent no Bearer token *also* has an
-# empty subject token, and that case must still raise MissingSubjectTokenError
-# rather than silently falling back to the agent's own identity (see
-# _OboOrAgentIdentityAuth).
-_startup_discovery_active = False
-
-
-class _OboOrAgentIdentityAuth(httpx.Auth):
-    """The OBO auth used for MCP proxy clients, with one deliberate escape
-    hatch for process startup.
-
-    Scout builds each proxy's ``MultiServerMCPClient`` once at import time
-    (see ``app.py``) and immediately calls ``get_tools()`` on it to learn
-    what tools that proxy exposes, before any ``/chat`` request — and
-    therefore any caller token — exists. ``DelegatedTokenAuth`` has no
-    fallback by design (see its docstring) and raises
-    ``MissingSubjectTokenError`` in that situation, which would otherwise
-    make every OBO-enabled proxy permanently discover zero tools, since
-    nothing ever retries that one-time call later.
-
-    Listing a proxy's available tool schemas isn't a delegated action taken
-    on any particular caller's behalf — it's platform metadata ("what
-    operations does this MCP server expose"), so it's fine for that one call
-    to use the agent's own AgentID identity instead. The routing below keys
-    strictly off ``_startup_discovery_active``, not off whether a caller
-    token happens to be present: every actual tool *invocation* happens
-    inside ``app.py``'s ``subject_token_scope(...)`` block with that flag
-    false, so it always goes through the real ``DelegatedTokenAuth`` flow,
-    even when that particular caller sent no token — which correctly raises
-    ``MissingSubjectTokenError`` instead of silently running as the agent.
-    """
-
-    def __init__(self, resource: str, scopes: Sequence[str] = (), *, proxy_handle: str | None = None) -> None:
-        self._delegated = DelegatedTokenAuth(resource=resource, scopes=scopes, proxy_handle=proxy_handle)
-        self._agent_identity = AgentIdentityAuth(resource=resource)
-
-    async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
-        auth = self._agent_identity if _startup_discovery_active else self._delegated
-        flow = auth.async_auth_flow(request)
-        next_request = await flow.asend(None)
-        while True:
-            response = yield next_request
-            try:
-                next_request = await flow.asend(response)
-            except StopAsyncIteration:
-                break
 
 
 def _server_configs() -> dict[str, dict[str, Any]]:
@@ -90,20 +41,15 @@ def _server_configs() -> dict[str, dict[str, Any]]:
     attaches a live `Authorization: Bearer` token to every request, minted
     and refreshed on demand.
 
-    When AMP_OBO_ENABLED is also true, that `auth` is _OboOrAgentIdentityAuth
-    instead (see its docstring above): each real /chat tool call exchanges
-    the current request's caller token for one scoped to that proxy, rather
-    than using this agent's own client_credentials identity — except the
-    one-time startup discovery call below, which has no caller token yet.
+    When AMP_OBO_ENABLED is also true, that `auth` is DelegatedTokenAuth
+    instead (see obo_identity.py): each MCP call tries this agent's own
+    identity first, and only exchanges the current request's caller token
+    for one scoped to that proxy if the gateway's own challenge proves this
+    specific call actually needs delegation.
     """
     proxies = {
-        "fetch": (
-            settings.fetch_mcp_url, settings.fetch_mcp_api_key, settings.fetch_obo_scopes, settings.fetch_proxy_handle,
-        ),
-        "deepwiki": (
-            settings.deepwiki_mcp_url, settings.deepwiki_mcp_api_key, settings.deepwiki_obo_scopes,
-            settings.deepwiki_proxy_handle,
-        ),
+        "fetch": (settings.fetch_mcp_url, settings.fetch_mcp_api_key),
+        "deepwiki": (settings.deepwiki_mcp_url, settings.deepwiki_mcp_api_key),
     }
 
     logger.info("=" * 70)
@@ -119,12 +65,12 @@ def _server_configs() -> dict[str, dict[str, Any]]:
     )
     logger.info(
         "[DEBUG] Auth mode: %s",
-        "OBO (delegated, per-caller token exchange)" if use_obo
+        "OBO (own identity first, delegated on challenge)" if use_obo
         else "client_credentials (this agent's own static identity)",
     )
 
     configs: dict[str, dict[str, Any]] = {}
-    for name, (url, api_key, obo_scopes_raw, proxy_handle) in proxies.items():
+    for name, (url, api_key) in proxies.items():
         # Log the actual values (including secrets) for debugging
         logger.info(
             "[DEBUG] MCP proxy '%s': url='%s' | api_key='%s'",
@@ -156,13 +102,9 @@ def _server_configs() -> dict[str, dict[str, Any]]:
         }
         if use_obo:
             if name not in _mcp_auths:
-                scopes = obo_scopes_raw.split() if obo_scopes_raw else ()
-                _mcp_auths[name] = _OboOrAgentIdentityAuth(resource=url, scopes=scopes, proxy_handle=proxy_handle)
+                _mcp_auths[name] = DelegatedTokenAuth(resource=url)
             config["auth"] = _mcp_auths[name]
-            logger.info(
-                "  [OK]   '%s' OBO delegated-token auth attached (scopes=%s, proxy_handle=%s)",
-                name, obo_scopes_raw or "(none requested)", proxy_handle,
-            )
+            logger.info("  [OK]   '%s' OBO auth attached (own identity first, delegated on challenge)", name)
         elif identity_ready:
             if name not in _mcp_auths:
                 _mcp_auths[name] = AgentIdentityAuth(resource=url)
@@ -185,20 +127,16 @@ async def load_mcp_tools() -> list:
     none are configured or all fail — so the agent always starts, at worst
     with native tools only.
 
-    Runs with _startup_discovery_active set for its whole duration (see that
-    flag's docstring on _OboOrAgentIdentityAuth) — this function is only ever
-    called once, before the app serves any request, so there is nothing else
-    running concurrently for the flag to leak into.
+    Runs once, before the app serves any request — there is no caller token
+    yet at this point. Under OBO, that's fine: DelegatedTokenAuth's first
+    attempt always uses this agent's own identity (see obo_identity.py), and
+    tool discovery (listing a proxy's schemas) is exactly the kind of
+    operation that shouldn't need per-caller delegation in the first place.
+    If a proxy's gateway policy really does demand delegation even for
+    discovery, this call has no caller token to delegate as and will fail
+    for that proxy — the same outcome as any other genuinely-misconfigured
+    proxy, surfaced the normal way below rather than silently worked around.
     """
-    global _startup_discovery_active
-    _startup_discovery_active = True
-    try:
-        return await _load_mcp_tools_impl()
-    finally:
-        _startup_discovery_active = False
-
-
-async def _load_mcp_tools_impl() -> list:
     configs = _server_configs()
     if not configs:
         logger.warning(

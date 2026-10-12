@@ -23,38 +23,61 @@ not assumed from the RFC alone:
   authorization is mapping-based (an "authorization mapping" rule, exactly
   what Agent Manager's Connections page configures) and ``scope`` is omitted,
   ThunderID's handler treats the request as asking for nothing and grants
-  nothing. Which scopes to request per resource is configured below via
-  ``<PROXY>_OBO_SCOPES`` env vars.
+  nothing.
 - The caller's own token (the ``subject_token``) must be the live request's
   forwarded ``Authorization: Bearer <token>`` header — this only exists when
   Agent Manager's "Invocation security is OAuth" + "Token forwarding" are
   both enabled for this agent (see the Agent ID -> Delegated Access readiness
   checklist in the console).
 
-Challenge-and-retry (RFC 9728): a single exchange is not the whole story. If
-the MCP gateway rejects a call because the delegated token lacks a scope, it
-is expected to answer with::
+Discovery-first (RFC 9728), corrected 2026-10-12: an earlier version of this
+module pre-decided which scope to request per MCP resource from a
+``<PROXY>_OBO_SCOPES`` env var, exchanged *before* ever calling the resource,
+and treated a 401/403 challenge as a fallback for when that guess was wrong.
+Live testing proved that path never actually gets exercised in practice — the
+pre-known scope is always already right, so the gateway never has a reason to
+challenge it, which also means the gateway's own challenge behavior was never
+verified. Background research into MCP's own Authorization specification
+(https://modelcontextprotocol.io/specification/draft/basic/authorization)
+confirmed the mechanism was backwards: discovery-by-challenge is the *normal*
+MCP path, not recovery. Its "Scope Selection Strategy" section gives a client
+exactly two ways to learn what scope to request — the challenge's own
+``scope`` parameter, or else the resource's ``scopes_supported`` — with no
+"ask an admin to pre-configure it" step at all.
 
-    403 Forbidden
-    WWW-Authenticate: Bearer error="insufficient_scope",
-      scope="orders:read",
-      resource_metadata="https://gateway.example.com/orders/.well-known/oauth-protected-resource"
+``DelegatedTokenAuth`` now follows that flow directly:
 
-``DelegatedTokenAuth`` reacts to exactly that: it fetches and validates the
-advertised protected-resource metadata, re-exchanges the *original* caller
-token (never the token it already minted — there is no token-of-a-token
-chaining in this design) for the resource/scope the challenge named, and
-retries the call once. This means the ``<PROXY>_OBO_SCOPES`` env vars below
-are a starting guess, not a requirement: leaving them unset still works as
-long as the gateway's challenge is correct, which is the one thing this
-module cannot guarantee — see the caveat below.
+1. Attempt the call with this agent's own AgentID identity (the same
+   client_credentials token ``agent_identity.py`` would use). An operation
+   that doesn't actually require delegation — listing available tools,
+   reading something this agent's own role already covers — just succeeds
+   here, with no exchange at all.
+2. A 401/403 proves this specific operation needs delegation. Fetch and
+   validate the challenge's RFC 9728 protected-resource metadata, read the
+   required scope off the challenge (or the metadata's ``scopes_supported``
+   as a fallback), and exchange the *caller's* token — never this agent's own
+   — for exactly that resource/scope.
+3. Retry with the delegated token. If the gateway comes back with a second
+   ``insufficient_scope`` challenge (a genuine step-up: the first delegated
+   token was correctly scoped for the first challenge, but this particular
+   operation needs more), union the newly-named scope with what was already
+   held, re-exchange once more, and retry — then stop, bounded, win or lose.
+
+Nothing here pre-declares a resource's required scope anywhere, and nothing
+needs to: it is read off the response every time. A caller token's already-
+exchanged scope set is remembered per resource for the rest of its lifetime
+(see ``_known_scopes``) purely as a round-trip-saving cache, not as a second
+source of truth — it is tried first but discarded the moment the gateway
+disagrees with it.
 
 Known caveat, carried over from the platform's own design doc rather than
 discovered here: as of this writing the MCP gateway policy has a documented,
 not-yet-confirmed-fixed bug where it reports ``invalid_token`` instead of
-``insufficient_scope`` for this exact missing-scope case. This module treats
-both error codes as a possible scope challenge so it recovers either way;
-a genuinely invalid/expired subject token still fails safely, since that
+``insufficient_scope`` for a missing-scope case. This module treats both
+error codes (and a bare 401/403 with no ``error`` parameter at all, which is
+what MCP's own spec shows for a plain "no token" challenge) as a reactable
+challenge, so it recovers regardless of which one actually comes back; a
+genuinely invalid/expired subject token still fails safely, since that
 response carries no usable ``resource_metadata`` to retry against.
 """
 
@@ -62,7 +85,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import time
 import uuid
@@ -74,6 +96,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from agent_identity import AgentIdentityAuth
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -106,12 +129,20 @@ SUBJECT_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:jwt"
 # agent's code.
 _DENIAL_ERROR_CODES = frozenset({"access_denied", "invalid_target", "invalid_scope", "invalid_request"})
 
-# MCP-gateway challenge error codes worth reacting to. insufficient_scope is
-# the RFC 9728-correct code for "right token, wrong scope"; invalid_token is
-# included because of the documented, not-yet-confirmed-fixed gateway bug
-# described in the module docstring. Anything else (or a challenge with no
+# MCP-gateway challenge error codes worth reacting to, alongside a bare
+# challenge with no `error` parameter at all (MCP's own spec shows exactly
+# that for a plain "no token" 401). insufficient_scope is the RFC
+# 9728-correct code for "right token, wrong scope"; invalid_token is included
+# because of the documented, not-yet-confirmed-fixed gateway bug described in
+# the module docstring. Anything else (or a challenge with no
 # resource_metadata) is returned to the caller as-is, not retried.
-_CHALLENGE_ERROR_CODES = frozenset({"insufficient_scope", "invalid_token"})
+_CHALLENGE_ERROR_CODES = frozenset({None, "insufficient_scope", "invalid_token"})
+
+# Bounded step-up retries beyond the first discovery exchange (see MCP's own
+# Step-Up Authorization Flow: "retry ... no more than a few times"). Total
+# request attempts per call is this plus two: the own-identity probe and the
+# first delegated exchange.
+_MAX_STEP_UPS = 1
 
 _ERROR_BODY_SNIPPET_LEN = 200
 
@@ -167,69 +198,6 @@ class TokenExchangeError(Exception):
 
 class DelegationDeniedError(TokenExchangeError):
     """The exchange was well-formed but denied: no trust/mapping/scope path."""
-
-
-@dataclass(frozen=True)
-class DelegationCeiling:
-    """This agent's admin-set delegation ceiling: the MCP resources/scopes it
-    may request on a caller's behalf, keyed by MCP proxy handle (e.g.
-    ``"fetch"``) — injected by Agent Manager as ``AMP_OBO_DELEGATION_CEILING``
-    whenever OBO enablement or the ceiling itself changes.
-
-    ThunderID enforces no equivalent limit of its own: its token-exchange
-    grant handler resolves permissions purely from the caller's mapped role,
-    with no concept of which AgentID authenticated the exchange (confirmed
-    against ThunderID's own integration test suite — a mapping's target role,
-    with zero agent/user assignment of its own, is still reachable by any
-    caller whose claims match it). Without this check, a role that happens to
-    grant more than an agent should request would do so silently. ``check``
-    is the enforcement point: called before every delegated exchange attempt,
-    so a misconfigured ``<PROXY>_OBO_SCOPES`` value can never reach ThunderID
-    at all — refuse, don't narrow, matching ``MissingSubjectTokenError``'s own
-    no-fallback posture.
-    """
-
-    _by_handle: dict[str, frozenset[str]]
-
-    @classmethod
-    def from_env(cls, raw: str) -> DelegationCeiling:
-        if not raw:
-            return cls(_by_handle={})
-        try:
-            parsed = json.loads(raw)
-        except ValueError:
-            logger.error(
-                "[OBO][FAIL] AMP_OBO_DELEGATION_CEILING is not valid JSON — treating it as empty, "
-                "so every delegated request will be refused client-side until this is fixed: %r",
-                raw[:200],
-            )
-            return cls(_by_handle={})
-
-        by_handle: dict[str, frozenset[str]] = {}
-        for entry in parsed if isinstance(parsed, list) else []:
-            if not isinstance(entry, dict):
-                continue
-            resource = entry.get("resource")
-            scopes = entry.get("scopes")
-            if isinstance(resource, str) and isinstance(scopes, list):
-                by_handle[resource] = frozenset(s for s in scopes if isinstance(s, str))
-        return cls(_by_handle=by_handle)
-
-    def check(self, proxy_handle: str, requested_scopes: Sequence[str]) -> None:
-        """Raise DelegationDeniedError if proxy_handle isn't on this agent's
-        injected ceiling, or if any requested_scopes for it aren't."""
-        allowed = self._by_handle.get(proxy_handle)
-        if allowed is None:
-            raise DelegationDeniedError(
-                f"resource {proxy_handle!r} is not on this agent's delegation ceiling "
-                "(AMP_OBO_DELEGATION_CEILING) — add it to this AgentID in the console before requesting it"
-            )
-        disallowed = [s for s in requested_scopes if s not in allowed]
-        if disallowed:
-            raise DelegationDeniedError(
-                f"scopes {disallowed} for resource {proxy_handle!r} are not on this agent's delegation "
-                f"ceiling (allowed: {sorted(allowed)})"
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -335,9 +303,11 @@ def record_obo_failure(exc: BaseException) -> None:
 
     A no-op outside any subject_token_scope (current_request_key() is None)
     — the one-time startup discovery call is the only place that's true, and
-    it never reaches DelegatedTokenAuth's raise sites in the first place (see
-    _OboOrAgentIdentityAuth), so this is just a defensive guard, not a path
-    anything is expected to actually take.
+    it never reaches a raise site that needs a subject token in the first
+    place (see DelegatedTokenAuth: a discovery call that succeeds with this
+    agent's own identity never touches the subject-token path at all), so
+    this is just a defensive guard, not a path anything is expected to
+    actually take.
     """
     request_key = _current_request_key.get()
     if request_key is None:
@@ -369,107 +339,122 @@ def obo_enabled() -> bool:
     return settings.obo_enabled and agent_identity_configured()
 
 
-_delegation_ceiling = DelegationCeiling.from_env(settings.obo_delegation_ceiling_raw)
-
-
-def delegation_ceiling() -> DelegationCeiling:
-    """This agent's injected delegation ceiling, parsed once at process
-    startup like every other setting — Agent Manager rolls the pod with a
-    fresh value whenever the ceiling changes, the same way it already does
-    for AMP_AGENTID_SCOPES."""
-    return _delegation_ceiling
-
-
 class DelegatedTokenAuth(httpx.Auth):
-    """Attaches a delegated (OBO) bearer token to every MCP request for one
-    resource, exchanging the current request's caller token for one scoped
-    to that resource via RFC 8693 token exchange.
+    """Attaches the right bearer token to every MCP request for one resource,
+    discovering per call whether delegation is even needed and, when it is,
+    exchanging the current request's caller token for one scoped to exactly
+    what the gateway's own challenge named (RFC 8693 + RFC 9728 — see the
+    module docstring for the full flow and why it changed on 2026-10-12).
 
     One instance per MCP proxy, same as AgentIdentityAuth, and for the same
     reason: a token exchange binds to one target resource server, so proxies
     cannot share a cache.
 
-    There is deliberately no fallback to the agent's own identity: a tool
-    call made without an active caller token raises MissingSubjectTokenError
-    rather than silently running as the agent instead of the user. Nor is
-    there a fallback past the injected delegation ceiling (see
-    DelegationCeiling): a request for a resource/scope outside it raises
-    DelegationDeniedError before ever reaching ThunderID.
+    There is deliberately no fallback past a genuine delegation requirement:
+    once a 401/403 proves this call needs the caller's own identity, a
+    missing caller token raises MissingSubjectTokenError rather than silently
+    running as the agent instead of the user.
     """
 
-    def __init__(self, resource: str, scopes: Sequence[str] = (), *, proxy_handle: str | None = None) -> None:
+    def __init__(self, resource: str) -> None:
         self._resource = resource
-        self._scopes = tuple(scopes)
-        # The ceiling is keyed by MCP proxy handle (e.g. "fetch"), not by this
-        # resource's resolved URL — see DelegationCeiling's docstring. Falls
-        # back to the resource URL itself only if no handle was given, which
-        # will simply never match any ceiling entry and so always deny; every
-        # real construction site (mcp_tools.py) always passes one.
-        self._proxy_handle = proxy_handle or resource
+        self._own_identity = AgentIdentityAuth(resource=resource)
         # Cache keyed by (hash of caller token, resource, scopes): the same
         # caller re-invoking the same tool within the token's lifetime reuses
         # the exchanged token instead of re-exchanging on every call. The
         # subject token itself is hashed, never stored or logged, since it's
         # a live caller credential, not this agent's own static secret.
         self._cache: dict[str, tuple[str, float]] = {}
+        # Remembers, per caller, the scope set that last worked for this
+        # resource — purely a round-trip-saving shortcut so a second tool
+        # call in the same (or a later) turn can go straight to a delegated
+        # token instead of re-probing with this agent's own identity and
+        # re-running discovery every single time. Never trusted past the
+        # gateway's own say-so: the moment it stops working (role/mapping
+        # changed, a different operation needs more), async_auth_flow falls
+        # straight back into full discovery, same as if nothing were cached.
+        self._known_scopes: dict[str, tuple[str, ...]] = {}
         self._lock = asyncio.Lock()
 
     async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
-        token = await self._get_delegated_token(self._resource, self._scopes)
-        logger.info(
-            "[OBO] attaching delegated Bearer token to request -> %s %s (resource=%s)",
-            request.method, request.url, self._resource,
-        )
+        subject_token = current_subject_token()
+        memo_key = self._subject_fingerprint(subject_token) if subject_token else None
+        remembered_scopes = self._known_scopes.get(memo_key, ()) if memo_key else ()
+
+        if remembered_scopes:
+            logger.info(
+                "[OBO] resource='%s' previously required delegation for this caller — skipping the "
+                "own-identity probe and exchanging directly for the remembered scope=%s",
+                self._resource, remembered_scopes,
+            )
+            token = await self._get_delegated_token(self._resource, remembered_scopes)
+        else:
+            token = await self._own_identity.get_token()
+            logger.info(
+                "[OBO] attempting %s %s with this agent's own identity first (resource=%s)",
+                request.method, request.url, self._resource,
+            )
         request.headers["Authorization"] = f"Bearer {token}"
         response = yield request
 
-        if response.status_code not in (401, 403):
-            return
+        held_scopes = set(remembered_scopes)
+        for _ in range(_MAX_STEP_UPS + 1):
+            if response.status_code not in (401, 403):
+                return
 
-        # The server just told us this exact token is no good (401) or lacks a
-        # scope (403) — either way, serving it again from cache next call
-        # would just repeat the same failure until it naturally expires.
-        await self._evict_cached_token(token)
+            await self._evict_cached_token(token)
+            challenge = _parse_www_authenticate(response.headers.get("WWW-Authenticate", ""))
+            if challenge.error not in _CHALLENGE_ERROR_CODES or not challenge.resource_metadata:
+                # Not a challenge this knows how to act on (e.g. a genuinely
+                # invalid/expired token with no resource_metadata) — surface
+                # the response as-is rather than guessing at a retry.
+                return
 
-        challenge = _parse_www_authenticate(response.headers.get("WWW-Authenticate", ""))
-        if challenge.error not in _CHALLENGE_ERROR_CODES or not challenge.resource_metadata:
-            # Not a scope challenge this knows how to act on (e.g. a genuinely
-            # invalid/expired token with no resource_metadata) — surface the
-            # original response rather than guessing at a retry.
-            return
-
-        logger.warning(
-            "[OBO] got a %s challenge (error=%s) for resource='%s' — fetching its protected-resource "
-            "metadata and retrying once with the scope/resource it names",
-            response.status_code, challenge.error, self._resource,
-        )
-
-        try:
-            resource, retry_scopes = await self._resolve_challenge(challenge)
-        except UntrustedMetadataError:
-            logger.exception(
-                "[OBO][FAIL] refusing to retry — protected-resource metadata at '%s' failed validation",
-                challenge.resource_metadata,
+            logger.warning(
+                "[OBO] got a %s challenge (error=%s) for resource='%s' — fetching its protected-resource "
+                "metadata to learn what scope delegation actually needs here",
+                response.status_code, challenge.error, self._resource,
             )
-            return
 
-        try:
-            new_token = await self._get_delegated_token(resource, retry_scopes)
-        except (MissingSubjectTokenError, TokenExchangeError):
-            logger.exception("[OBO][FAIL] retry exchange failed for resource='%s'", resource)
-            return
+            try:
+                resource, new_scopes = await self._resolve_challenge(challenge)
+            except UntrustedMetadataError:
+                logger.exception(
+                    "[OBO][FAIL] refusing to exchange — protected-resource metadata at '%s' failed validation",
+                    challenge.resource_metadata,
+                )
+                return
 
-        request.headers["Authorization"] = f"Bearer {new_token}"
-        yield request
+            held_scopes |= set(new_scopes)
+
+            try:
+                token = await self._get_delegated_token(resource, sorted(held_scopes))
+            except (MissingSubjectTokenError, TokenExchangeError):
+                logger.exception("[OBO][FAIL] exchange failed for resource='%s' scopes=%s", resource, held_scopes)
+                return
+
+            if memo_key:
+                self._known_scopes[memo_key] = tuple(sorted(held_scopes))
+
+            request.headers["Authorization"] = f"Bearer {token}"
+            response = yield request
+        # Retries exhausted (bounded step-up per MCP's own Step-Up
+        # Authorization Flow) — whatever the last response was stands.
 
     async def _resolve_challenge(self, challenge: _Challenge) -> tuple[str, Sequence[str]]:
         """Validate the challenge's RFC 9728 metadata and return the
-        (resource, scopes) to re-exchange for.
+        (resource, scopes) to exchange for.
 
         Refuses the metadata unless it is HTTPS, valid JSON, and advertises
         exactly the resource this instance already targets — a resource
         server cannot use its own challenge to redirect this agent into
         minting a token for some other resource.
+
+        Scope comes from the challenge's own ``scope`` parameter if present;
+        otherwise falls back to the metadata's ``scopes_supported`` — exactly
+        MCP's own Scope Selection Strategy priority order. There is no third
+        fallback: a challenge naming neither simply yields no scope, and the
+        resulting exchange request will ask ThunderID for none.
         """
         metadata_url = challenge.resource_metadata or ""
         if urlsplit(metadata_url).scheme != "https":
@@ -495,21 +480,14 @@ class DelegatedTokenAuth(httpx.Auth):
                 f"resource_metadata advertises resource {advertised_resource!r}, expected {self._resource!r}"
             )
 
-        retry_scopes: Sequence[str] = (challenge.scope,) if challenge.scope else self._scopes
-        return advertised_resource, retry_scopes
+        if challenge.scope:
+            scopes: Sequence[str] = tuple(challenge.scope.split())
+        else:
+            supported = data.get("scopes_supported") if isinstance(data, dict) else None
+            scopes = tuple(s for s in supported if isinstance(s, str)) if isinstance(supported, list) else ()
+        return advertised_resource, scopes
 
     async def _get_delegated_token(self, resource: str, scopes: Sequence[str]) -> str:
-        try:
-            delegation_ceiling().check(self._proxy_handle, scopes)
-        except DelegationDeniedError as exc:
-            logger.error(
-                "[OBO][FAIL] %s — refusing to request it rather than relying on ThunderID to also "
-                "enforce this (it does not; see DelegationCeiling's docstring)",
-                exc,
-            )
-            record_obo_failure(exc)
-            raise
-
         subject_token = current_subject_token()
         if not subject_token:
             logger.error(
@@ -548,12 +526,17 @@ class DelegatedTokenAuth(httpx.Auth):
         digest = hashlib.sha256(subject_token.encode("utf-8")).hexdigest()
         return f"{digest}|{resource}|{','.join(sorted(scopes))}"
 
+    @staticmethod
+    def _subject_fingerprint(subject_token: str) -> str:
+        return hashlib.sha256(subject_token.encode("utf-8")).hexdigest()
+
     async def _evict_cached_token(self, token: str) -> None:
         """Remove token from the cache, however it got there — a 401/403
         response is authoritative over the cache's own TTL. Matches by value
-        rather than recomputing the cache key, since the exact (subject,
-        scopes) pairing that produced token isn't available at the call site
-        (self._scopes may differ from what a prior challenge retry requested)."""
+        rather than recomputing the cache key, since the exact scope set that
+        produced token isn't available at every call site (e.g. this agent's
+        own-identity token, which was never in self._cache to begin with —
+        a harmless no-op in that case)."""
         async with self._lock:
             stale_keys = [key for key, (cached_token, _) in self._cache.items() if cached_token == token]
             for key in stale_keys:

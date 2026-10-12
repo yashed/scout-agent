@@ -46,33 +46,22 @@ class Settings(BaseSettings):
     agentid_token_endpoint: str = Field(default="", validation_alias="AMP_AGENTID_TOKEN_ENDPOINT")
     agentid_scopes: str = Field(default="", validation_alias="AMP_AGENTID_SCOPES")
 
-    # OBO (On-Behalf-Of / delegated access). When true, MCP calls exchange the
-    # caller's own forwarded access token (RFC 8693 token exchange) for a
-    # token scoped to the target resource, instead of using this agent's own
-    # client_credentials identity. Requires: this agent's "Token-exchange
-    # grant" enabled, a trusted issuer connection enabled for the environment
-    # with an authorization mapping, and (for actual scopes to be granted,
-    # see obo_identity.py's module docstring) the per-proxy scopes below set
-    # to real scopes that mapping grants.
+    # OBO (On-Behalf-Of / delegated access). When true, MCP calls that turn
+    # out to require it exchange the caller's own forwarded access token
+    # (RFC 8693 token exchange) for a token scoped to the target resource,
+    # instead of using this agent's own client_credentials identity. Requires
+    # this agent's "Token-exchange grant" enabled and a trusted issuer
+    # connection enabled for the environment with an authorization mapping.
+    #
+    # Revised 2026-10-12: there used to be a FETCH_OBO_SCOPES/
+    # DEEPWIKI_OBO_SCOPES/AMP_OBO_DELEGATION_CEILING trio here, pre-declaring
+    # which scope each MCP resource needed and which ones this agent was
+    # allowed to request. Removed — scope is discovered per call from the
+    # MCP gateway's own 401/403 challenge (RFC 9728), never pre-configured
+    # (see obo_identity.py's module docstring), and the ceiling is enforced
+    # once, authoritatively, inside ThunderID's own authorization mapping,
+    # not duplicated here for this agent to re-check.
     obo_enabled: bool = Field(default=False, validation_alias="AMP_OBO_ENABLED")
-    fetch_obo_scopes: str = Field(default="", validation_alias="FETCH_OBO_SCOPES")
-    deepwiki_obo_scopes: str = Field(default="", validation_alias="DEEPWIKI_OBO_SCOPES")
-
-    # Which MCP proxy (by its stable handle, e.g. "fetch") each of this
-    # agent's own Tool Configuration URLs above corresponds to — needed to
-    # match AMP_OBO_DELEGATION_CEILING's proxy-handle-keyed entries (see
-    # obo_identity.py's DelegationCeiling) back to FETCH_URL/DEEPWIKI_URL.
-    # Defaults match this agent's own Tool Configuration names; override if
-    # yours differ from the underlying MCP Server's handle.
-    fetch_proxy_handle: str = Field(default="fetch", validation_alias="FETCH_PROXY_HANDLE")
-    deepwiki_proxy_handle: str = Field(default="deepwiki", validation_alias="DEEPWIKI_PROXY_HANDLE")
-
-    # Admin-set delegation ceiling, injected by Agent Manager as a JSON array
-    # of {"resource": "<proxy handle>", "scopes": [...]} whenever OBO
-    # enablement or the ceiling itself changes. See obo_identity.py's
-    # DelegationCeiling for how this agent enforces it before ever asking
-    # ThunderID for a delegated scope.
-    obo_delegation_ceiling_raw: str = Field(default="", validation_alias="AMP_OBO_DELEGATION_CEILING")
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -120,14 +109,6 @@ def dump_settings() -> None:
     logger.info("  AMP_AGENTID_TOKEN_ENDPOINT = %s", settings.agentid_token_endpoint if settings.agentid_token_endpoint else "(unset)")
     logger.info("  AMP_AGENTID_SCOPES         = %s", settings.agentid_scopes if settings.agentid_scopes else "(unset)")
     logger.info("  AMP_OBO_ENABLED            = %s", settings.obo_enabled)
-    logger.info("  FETCH_OBO_SCOPES           = %s", settings.fetch_obo_scopes if settings.fetch_obo_scopes else "(unset)")
-    logger.info("  DEEPWIKI_OBO_SCOPES        = %s", settings.deepwiki_obo_scopes if settings.deepwiki_obo_scopes else "(unset)")
-    logger.info("  FETCH_PROXY_HANDLE         = %s", settings.fetch_proxy_handle)
-    logger.info("  DEEPWIKI_PROXY_HANDLE      = %s", settings.deepwiki_proxy_handle)
-    logger.info(
-        "  AMP_OBO_DELEGATION_CEILING = %s",
-        settings.obo_delegation_ceiling_raw if settings.obo_delegation_ceiling_raw else "(unset)",
-    )
     logger.info("=" * 70)
 
     # Quick validation checks
@@ -191,28 +172,14 @@ def dump_settings() -> None:
     # OBO validation
     if settings.obo_enabled:
         if agentid_all_set:
-            logger.info("  [OK]    AMP_OBO_ENABLED is true — MCP calls will use delegated (OBO) access")
+            logger.info(
+                "  [OK]    AMP_OBO_ENABLED is true — MCP calls try this agent's own identity first, "
+                "then delegate on challenge (see obo_identity.py)"
+            )
         else:
             logger.warning(
                 "  [FAIL]  AMP_OBO_ENABLED is true but AgentID credentials are NOT set — "
                 "OBO exchange cannot authenticate as this agent and every tool call will fail"
-            )
-        if not settings.fetch_obo_scopes and settings.fetch_mcp_url:
-            logger.warning(
-                "  [WARN]  FETCH_OBO_SCOPES is unset — ThunderID grants no permission scopes for a "
-                "mapping-based exchange with no requested scope, so Fetch calls will likely come back "
-                "with an empty-scope token"
-            )
-        if not settings.deepwiki_obo_scopes and settings.deepwiki_mcp_url:
-            logger.warning(
-                "  [WARN]  DEEPWIKI_OBO_SCOPES is unset — same as above, for DeepWiki"
-            )
-        if not settings.obo_delegation_ceiling_raw:
-            logger.warning(
-                "  [WARN]  AMP_OBO_DELEGATION_CEILING is unset — this agent has no admin-configured "
-                "delegation ceiling injected yet, so every delegated request will be refused client-side "
-                "(see obo_identity.py's DelegationCeiling). Add at least one resource to this AgentID's "
-                "delegation ceiling in the console."
             )
     else:
         logger.info("  [INFO]  AMP_OBO_ENABLED is false — MCP calls use this agent's own client_credentials identity")

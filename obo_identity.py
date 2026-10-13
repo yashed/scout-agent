@@ -417,6 +417,14 @@ class DelegatedTokenAuth(httpx.Auth):
                 "[OBO] attempting %s %s with this agent's own identity first (resource=%s)",
                 request.method, request.url, self._resource,
             )
+            # [DEBUG-ONLY, prints a real credential] Local-testing aid for
+            # comparing this agent's own identity token against the delegated
+            # one minted below (e.g. decoding both at jwt.io to see sub/act/
+            # aud/scope differ as expected). Same convention as config.py's
+            # dump_all_env_vars/dump_settings: intentionally logs a secret for
+            # troubleshooting. Remove before this ever runs anywhere logs are
+            # shipped off this machine.
+            logger.info("[OBO][DEBUG] own-identity token (pre-exchange) = %s", token)
         request.headers["Authorization"] = f"Bearer {token}"
         response = yield request
 
@@ -620,6 +628,10 @@ class DelegatedTokenAuth(httpx.Auth):
             "[OBO][OK] delegated token minted for resource='%s' scope='%s' expires_in=%s",
             resource, payload.get("scope"), expires_in,
         )
+        # [DEBUG-ONLY, prints a real credential] See the matching comment at
+        # the own-identity log line above — same local-testing purpose, same
+        # removal-before-shipping-logs-anywhere caveat.
+        logger.info("[OBO][DEBUG] delegated token (post-exchange) = %s", access_token)
         return access_token, expiry
 
     def _error_for_response(self, response: httpx.Response, resource: str) -> TokenExchangeError:

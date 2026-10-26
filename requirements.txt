@@ -1,8 +1,9 @@
 fastapi==0.115.0
-uvicorn==0.30.6
+uvicorn==0.54.0
 langgraph==0.2.76
 langchain-openai==0.3.35
 langchain-mcp-adapters>=0.1.0,<0.2.0
 pydantic==2.12.5
 pydantic-settings==2.6.1
 requests==2.32.3
+mcp>=1.21.1,<2
